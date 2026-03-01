@@ -39,12 +39,12 @@ load_dotenv()
 #  HELPERS                                                                     #
 # =========================================================================== #
 class DocumentGraphMetadata(BaseModel):
-    """The structured schema for our Graph-Lite entity extraction."""
-    is_allowed: bool = Field(description="True if the document is a research paper, technical manual, or relevant policy. False if it is junk like an invoice or bill.")
-    document_type: str = Field(description="A 1-3 word classification of the document type.")
-    key_entities: List[str] = Field(description="Specific names of algorithms (e.g., 'Scaled Dot-Product'), organizations, technologies, or key people mentioned.")
-    primary_topics: List[str] = Field(description="The 2-3 broad themes of the document.")
-    brief_summary: str = Field(description="A one-sentence summary of what this document is about.")
+    is_allowed: bool = Field(default=True)
+    # Diversity Fix: We allow the AI to assign multiple broad categories
+    categories: List[str] = Field(description="Top 1-3 domain categories (e.g., 'Literature', 'Quantum Physics', 'Recipe', 'Legal')")
+    audience: str = Field(description="Target audience (e.g., 'General', 'Academic', 'Professional')")
+    primary_topics: List[str] = Field(description="3-5 highly specific keywords or entities")
+    brief_summary: str = Field(description="A one-sentence overview.")
 
 class QueryVariants(BaseModel):
     """Schema for the Query Rewriter to output structured search queries."""
@@ -72,7 +72,12 @@ def extract_document_entities(elements: list) -> DocumentGraphMetadata:
     structured_llm = llm.with_structured_output(DocumentGraphMetadata)
     
     prompt = f"""Analyze the following text from the beginning of a document.
-Extract the key entities, topics, and determine if it belongs in a highly technical AI/Engineering knowledge base.
+Extract key entities, specific topics, and determine the general domain categories.
+
+INSTRUCTIONS:
+1. 'is_allowed' is ALWAYS True unless the text is gibberish or empty.
+2. Be diverse in 'categories'. If it's a poem, use 'Arts/Poetry'. If it's a narrative essay, use 'Educational/Personal Narrative'.
+3. Extract the 'primary_topics' as searchable keywords.
 
 TEXT TO ANALYZE:
 {sample_text}
@@ -81,7 +86,7 @@ TEXT TO ANALYZE:
         # This returns a clean Python object, not a messy string!
         extracted_data = structured_llm.invoke([HumanMessage(content=prompt)])
         
-        print(f"  → Document Type: {extracted_data.document_type}")
+        print(f"  → Categories Found: {extracted_data.categories}")
         print(f"  → Entities Found: {extracted_data.key_entities[:3]}...")
         return extracted_data
         
@@ -368,12 +373,12 @@ def run_ingestion(pdf_path: str, export_json: bool = False, force: bool = False)
     
     # 4. ADVANCED GRAPH EXTRACTION & BOUNCER
     graph_data = extract_document_entities(elements)
-    
-    if not graph_data.is_allowed:
-        print(f"\n❌ INGESTION ABORTED: Document '{filename}' was rejected by the system.")
-        print(f"Identified as: {graph_data.document_type}")
-        # If running in Streamlit, raise an error so the UI shows a red warning
-        raise ValueError(f"Document rejected. Identified as {graph_data.document_type}. Please upload a valid knowledge document.")
+    print(f"  → AI Categorized as: {graph_data.categories}")
+    # if not graph_data.is_allowed:
+    #     print(f"\n❌ INGESTION ABORTED: Document '{filename}' was rejected by the system.")
+    #     print(f"Identified as: {graph_data.document_type}")
+    #     # If running in Streamlit, raise an error so the UI shows a red warning
+    #     raise ValueError(f"Document rejected. Identified as {graph_data.document_type}. Please upload a valid knowledge document.")
 
     # 5. Process and Upload (Passing the graph_data in!)
     chunks = create_chunks(elements)
@@ -428,7 +433,7 @@ def retrieve_chunks(query: str, k: int = 3, source_file: str = None, category: s
     if source_file:
         filter_dict["source"] = source_file
     if category and category != "All":
-        filter_dict["document_type"] = category
+        filter_dict["categories"] = [category]
         print(f"  [!] Applying Hard Database Filter: Only searching '{category}' documents.")
 
     # 2. MULTI-SEARCH & POOLING
@@ -566,6 +571,25 @@ def run_query(query: str, k: int = 3) -> str:
     answer = generate_answer(chunks, query)
     return answer
 
+def get_all_unique_categories() -> list:
+    """Fetches all unique category names from the database metadata."""
+    supabase = _build_supabase_client()
+    try:
+        # We fetch the metadata column from all documents
+        response = supabase.table(config.VECTOR_TABLE_NAME).select("metadata").execute()
+        
+        unique_cats = set()
+        for row in response.data:
+            meta = row.get("metadata", {})
+            # Get the categories list we stored
+            cats = meta.get("categories", [])
+            for c in cats:
+                unique_cats.add(c)
+        
+        return sorted(list(unique_cats))
+    except Exception as e:
+        print(f" ⚠️ Could not fetch categories: {e}")
+        return []
 
 # =========================================================================== #
 #  ENTRY POINT                                                                 #

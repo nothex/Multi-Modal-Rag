@@ -12,7 +12,7 @@ from cl import retrieve_chunks, generate_answer # We import these instead of run
 # Adding security via login password
 import streamlit as st
 from auth import verify_password,get_daily_password
-
+from cl import get_all_unique_categories
 st.set_page_config(page_title="Multimodal RAG", page_icon="🤖", layout="wide")
 
 # --- AUTHENTICATION LOGIC ---
@@ -77,17 +77,19 @@ with st.sidebar:
             st.warning("Please upload a PDF first.")
 
     # --- THE NEW GRAPH FILTER WIDGET ---
+    # --- DYNAMIC SEARCH FILTERS ---
     st.header("🎯 Search Filters")
-    st.markdown("Use AI-extracted metadata to narrow your search.")
     
-    # Create a list of options: "All" plus the categories from your config
-    category_options = ["All"] + config.ALLOWED_CATEGORIES
+    # 1. Fetch categories live from the DB
+    db_categories = get_all_unique_categories()
     
-    # The interactive dropdown
+    # 2. Build the options list
+    category_options = ["All"] + db_categories
+    
     selected_category = st.selectbox(
-        "Filter by Document Type:", 
+        "Filter by Domain Category:", 
         options=category_options,
-        index=0 # Defaults to "All"
+        index=0 
     )
 
     if st.button("🗑️ Clear Chat History", width="stretch"):

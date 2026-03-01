@@ -29,10 +29,12 @@ CLASSIFIER_LLM_MODEL = "meta-llama/llama-3-8b-instruct:free"
 
 # The only document types your system is allowed to ingest.
 ALLOWED_CATEGORIES = [
-    "research_paper", 
-    "reference_chart",
-    "technical_manual", 
-    "hr_policy"
+    "Technical Research", 
+    "Educational/Academic", 
+    "Business/Legal", 
+    "General Knowledge",
+    "Product Manual",
+    "Other"
 ]
 # The fast, smart text model for Inferencing (Answering questions)
 TEXT_LLM_MODEL = "arcee-ai/trinity-large-preview:free"
