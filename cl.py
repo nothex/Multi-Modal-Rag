@@ -45,8 +45,12 @@ class DocumentGraphMetadata(BaseModel):
     from existing categories OR a brand new one it invents.
     is_allowed is always True for real documents; only junk (spam, blank
     pages, corrupted files) gets rejected.
+
+    All fields have safe defaults so a partial or unexpected LLM response
+    never raises a Pydantic validation error.
     """
     is_allowed: bool = Field(
+        default=True,   # safe default: allow ingestion, don't silently reject
         description=(
             "True for any real document with meaningful content — papers, books, "
             "manuals, reports, guides, policies, articles, notes, etc. "
@@ -55,6 +59,7 @@ class DocumentGraphMetadata(BaseModel):
         )
     )
     document_type: str = Field(
+        default="general_document",
         description=(
             "A snake_case category label for this document. "
             "Choose the closest match from the existing categories list if one fits well. "
@@ -64,14 +69,25 @@ class DocumentGraphMetadata(BaseModel):
         )
     )
     key_entities: List[str] = Field(
+        default_factory=list,
         description="Specific names of algorithms, people, organizations, places, or technologies mentioned."
     )
     primary_topics: List[str] = Field(
+        default_factory=list,
         description="The 2-3 broad themes of the document."
     )
     brief_summary: str = Field(
+        default="No summary available.",
         description="A one-sentence summary of what this document is about."
     )
+
+    # ------------------------------------------------------------------ #
+    # Extra fields that older LLM responses may include.                  #
+    # Declaring them here with defaults means Pydantic won't crash if the #
+    # LLM returns them — they're just silently accepted and ignored.      #
+    # ------------------------------------------------------------------ #
+    categories: Optional[List[str]] = Field(default=None, exclude=True)
+    audience:   Optional[str]       = Field(default=None, exclude=True)
 
 
 class QueryVariants(BaseModel):
@@ -230,13 +246,16 @@ DOCUMENT EXCERPT:
 
     except Exception as exc:
         print(f"  ⚠ Classifier failed ({exc}). Defaulting to general_document.")
-        # On failure: allow ingestion as a generic document rather than rejecting
-        return DocumentGraphMetadata(
+        # model_construct() bypasses Pydantic validation entirely —
+        # guaranteed to never raise, even if the schema changes again.
+        return DocumentGraphMetadata.model_construct(
             is_allowed=True,
             document_type="general_document",
             key_entities=[],
             primary_topics=[],
             brief_summary="Classification failed — stored as general document.",
+            categories=None,
+            audience=None,
         )
 
 
