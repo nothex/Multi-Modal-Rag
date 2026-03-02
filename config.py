@@ -21,7 +21,7 @@ EMBEDDING_DIMENSIONS = 2048
 EMBEDDING_DEVICE     = "cuda"         # change to "cpu" if no NVIDIA GPU
 
 # ==================== LLM MODELS ====================
-VISION_LLM_MODEL     = "qwen/qwen2.5-vl-72b-instruct:free"          # balance: OCR + diagrams
+VISION_LLM_MODEL     = "qwen/qwen3-vl-30b-a3b-thinking"          # balance: OCR + diagrams
 CLASSIFIER_LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"     # taxonomy + query rewriting
 TEXT_LLM_MODEL       = "arcee-ai/trinity-large-preview:free"         # final answer generation
 
