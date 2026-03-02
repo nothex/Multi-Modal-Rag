@@ -210,56 +210,6 @@ if prompt := st.chat_input("Ask about your documents…"):
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
 
-                # if chunks:
-                #     with st.expander("🔍 Retrieved Sources", expanded=False):
-                #         for i, chunk in enumerate(chunks, 1):
-                #             meta     = chunk.metadata
-                #             original = meta.get("original_content")
-                #             if isinstance(original, str):
-                #                 try:
-                #                     original = json.loads(original)
-                #                 except Exception:
-                #                     original = {}
-                #             elif not isinstance(original, dict):
-                #                 original = {}
-
-                #             src   = meta.get("source", f"Document {i}")
-                #             cidx  = meta.get("chunk_index", "?")
-                #             dtype = meta.get("document_type", "unknown")
-
-                #             st.markdown(
-                #                 f"<div class='source-box'>"
-                #                 f"<b>[Source {i}]</b> {src} &nbsp;·&nbsp; chunk {cidx}"
-                #                 f" &nbsp;·&nbsp; <code>{dtype}</code></div>",
-                #                 unsafe_allow_html=True,
-                #             )
-                #             # Show a snippet of the raw text for transparency
-                #             raw_text = original.get("raw_text", chunk.page_content)
-                #             if raw_text:
-                #                 st.info(raw_text[:400] + ("…" if len(raw_text) > 400 else ""))
-
-                #             tables = original.get("tables_html", [])
-                #             if tables:
-                #                 st.write("📊 **Tables:**")
-                #                 for tbl in tables:
-                #                     st.markdown(tbl, unsafe_allow_html=True)
-
-                #             images_b64 = original.get("images_base64", [])
-                #             if images_b64:
-                #                 st.write("🖼️ **Images:**")
-                #                 for img_str in images_b64:
-                #                     # Use HTML/CSS to enforce a strict maximum height and perfect aspect ratio
-                #                     img_html = f'''
-                #                         <div style="text-align: center; margin-bottom: 15px; padding: 10px; background-color: #1e293b; border-radius: 8px;">
-                #                             <img src="data:image/jpeg;base64,{img_str}" 
-                #                                 style="max-width: 100%; max-height: 350px; object-fit: contain; border-radius: 4px;">
-                #                         </div>
-                #                     '''
-                #                     st.markdown(img_html, unsafe_allow_html=True)
-                #             st.divider()
-
-
-                
                 if chunks:
                     # 1. Collective Intelligence Indicator
                     unique_sources = list(set([doc.metadata.get("source", "Unknown") for doc in chunks]))
