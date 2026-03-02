@@ -31,7 +31,7 @@ from supabase.client import create_client
 from dotenv import load_dotenv
 
 import config
-
+import concurrent.futures 
 load_dotenv()
 
 # =========================================================================== #
@@ -168,9 +168,11 @@ def _sanitize_category(raw: str) -> str:
 
 def extract_document_entities(elements: list) -> DocumentGraphMetadata:
     log.info("Classifier analysing document...")
+    # Grab the first ~2000 characters (Title, Abstract, Introduction)
     sample_text = ""
-    for el in elements[:25]:
-        sample_text += el.text + "\n"
+    for el in elements[:50]: # Increased to 50 just in case the first 25 are empty images
+        if hasattr(el, "text") and el.text:  # <-- THE SAFETY CHECK
+            sample_text += el.text + "\n"
         if len(sample_text) > 2000:
             break
 
@@ -184,16 +186,22 @@ def extract_document_entities(elements: list) -> DocumentGraphMetadata:
     llm = _build_llm(use_classifier=True)
     structured_llm = llm.with_structured_output(DocumentGraphMetadata)
 
-    prompt = (
-        "You are a document taxonomy classifier.\n\n"
-        f"{taxonomy_hint}\n"
-        "RULES:\n"
-        "- is_allowed=True for any document with real readable content.\n"
-        "- is_allowed=False ONLY for blank, spam, or unreadable files.\n"
-        "- Invent or reuse a snake_case document_type.\n"
-        "- Extract key entities and write a one-sentence summary.\n\n"
-        f"DOCUMENT EXCERPT:\n{sample_text}"
-    )
+    # --- UPDATE YOUR PROMPT IN cl.py ---
+    prompt = f"""You are a strict, automated data-extraction API. You do not speak. You do not explain. 
+You ONLY output valid, raw JSON matching the requested schema.
+CRITICAL: Do not include markdown blocks like ```json. Do not include phrases like 'Here is the JSON'. 
+
+Analyze the following text from the beginning of a document.
+Extract key entities, specific topics, and determine the general domain categories.
+
+INSTRUCTIONS:
+1. 'is_allowed' is ALWAYS True unless the text is gibberish or empty.
+2. Be diverse in 'categories'. Provide 1 to 3 broad categories (e.g., 'Literature', 'Physics').
+3. Extract the 'primary_topics' as 3-5 searchable keywords.
+
+TEXT TO ANALYZE:
+{sample_text}
+"""
     try:
         result = structured_llm.invoke([HumanMessage(content=prompt)])
         result.document_type = _sanitize_category(result.document_type)
@@ -280,19 +288,32 @@ def _upload_image_to_storage(image_b64: str, chunk_uuid: str, img_index: int) ->
 
 
 def _ai_summary(text: str, tables: List[str], images: List[str], max_retries: int = 3) -> str:
-    prompt = f"You are creating a searchable description for document retrieval.\n\nTEXT CONTENT:\n{text}\n"
+    vision_instruction = (
+    "SYSTEM ROLE: You are a Multimodal Indexing Specialist. Your task is to extract the "
+    "Semantic Essence and Structural Data from this document chunk for a high-performance RAG system.\n\n"
+    
+    "EXTRACTION HEURISTICS:\n"
+    "1. NUMERICAL ANCHORING: Identify and transcribe every unique number, unit, and date. "
+    "Treat high-contrast, large-font numbers as primary 'Key Performance Indicators' (KPIs).\n"
+    "2. TABULAR LOGIC: If a table is present, summarize the relationship between the rows and columns "
+    "so a text-search can find specific intersections (e.g., 'X value for Y category is Z').\n"
+    "3. SYMBOLIC CORRELATION: Identify symbols, icons, or diagram labels and explain what "
+    "concept or metric they represent.\n"
+    "4. NO NARRATIVE: Avoid conversational filler. Use bulleted lists for data density.\n\n"
+    
+    "OUTPUT SCHEMA:\n"
+    "- [ENTITY_DENSITY]: Key names, products, or technical terms.\n"
+    "- [QUANTITATIVE_LOGS]: All raw numbers and their associated units/meanings.\n"
+    "- [STRUCTURAL_SUMMARY]: A 2-sentence explanation of what this page/image is 'about'.\n"
+    "- [POTENTIAL_QUERIES]: 3 specific questions this chunk could answer perfectly.\n\n"
+    "INDEXING OUTPUT:"
+)
+    prompt = f"{vision_instruction}\n\nTEXT CONTENT:\n{text}\n"
     if tables:
         prompt += "\nTABLES (HTML):\n"
         for i, tbl in enumerate(tables, 1):
             prompt += f"Table {i}:\n{tbl}\n\n"
-    prompt += (
-        "\nYOUR TASK:\nWrite a comprehensive searchable description covering:\n"
-        "1. Key facts, numbers, and data points\n"
-        "2. Main topics and concepts\n"
-        "3. Questions this content could answer\n"
-        "4. Visual content analysis (charts, diagrams, patterns)\n"
-        "5. Alternative search terms\n\nSEARCHABLE DESCRIPTION:"
-    )
+            
     message_content: list = [{"type": "text", "text": prompt}]
     for img_b64 in images:
         message_content.append({
@@ -321,61 +342,83 @@ def _ai_summary(text: str, tables: List[str], images: List[str], max_retries: in
     return summary
 
 
-def process_chunks(
-    chunks: list,
-    file_path: str,
-    file_hash: str,
-    graph_data: DocumentGraphMetadata,
-) -> Tuple[List[Document], List[str]]:
-    log.info("Processing %d chunks...", len(chunks))
-    docs:  List[Document] = []
-    ids:   List[str]      = []
-    filename  = os.path.basename(file_path)
+def process_chunks(chunks: list, file_path: str, file_hash: str, graph_data: DocumentGraphMetadata) -> tuple[List[Document], List[str]]:
+    """Convert raw unstructured chunks into LangChain Documents using Parallel AI Summarization."""
+    print(f"  Processing {len(chunks)} chunks...")
+    docs = []
+    ids = []
+    filename = os.path.basename(file_path)
     NAMESPACE = uuid.NAMESPACE_DNS
 
+    # 1. Separate chunks and prepare for parallel processing
+    processed_contents = []
+    rich_tasks = {} # Keep track of which chunk index needs an AI summary
+    
     for i, chunk in enumerate(chunks, 1):
-        content  = _separate_content(chunk)
-        chunk_id = str(uuid.uuid5(NAMESPACE, f"{file_hash}_chunk_{i}"))
+        content = _separate_content(chunk)
+        processed_contents.append((i, content))
+        
+        # If it has images or tables, flag it for the AI
+        if content["tables"] or content["images"]:
+            rich_tasks[i] = content
 
-        image_urls: List[str] = []
-        image_b64_fallback: List[str] = []
-        for j, img_b64 in enumerate(content["images"]):
-            url = _upload_image_to_storage(img_b64, chunk_id, j)
-            if url:
-                image_urls.append(url)
-            else:
-                image_b64_fallback.append(img_b64)
+    # 2. RUN AI SUMMARIES IN PARALLEL (The Speed Boost!)
+    ai_summaries = {}
+    if rich_tasks:
+        print(f"  ⚡ Launching {len(rich_tasks)} AI vision tasks in parallel...")
+        
+        # Open 5 "cash registers" at once to talk to OpenRouter
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all tasks to the pool
+            future_to_index = {
+                executor.submit(_ai_summary, c["text"], c["tables"], c["images"]): idx 
+                for idx, c in rich_tasks.items()
+            }
+            
+            # Gather results as they finish
+            for future in concurrent.futures.as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    summary = future.result()
+                    ai_summaries[idx] = summary
+                except Exception as exc:
+                    print(f"  ⚠ Chunk {idx} generated an exception: {exc}")
+                    ai_summaries[idx] = rich_tasks[idx]["text"][:300] # Fallback
 
-        has_rich = bool(content["tables"] or content["images"])
-        if has_rich:
-            log.info("[%d/%d] Rich chunk %s → AI summary", i, len(chunks), content["types"])
-            page_content = _ai_summary(content["text"], content["tables"], content["images"])
+    # 3. Build the final Langchain Documents in the correct order
+    for i, content in processed_contents:
+        if i in ai_summaries:
+            page_content = ai_summaries[i]
+            print(f"    [{i}/{len(chunks)}] 🖼️ Applied Parallel AI Summary")
         else:
-            log.info("[%d/%d] Text-only chunk", i, len(chunks))
             page_content = content["text"]
+            print(f"    [{i}/{len(chunks)}] 📄 Applied Text-only chunk")
 
         doc = Document(
             page_content=page_content,
             metadata={
-                "source":        filename,
-                "file_hash":     file_hash,
-                "document_type": graph_data.document_type,
-                "entities":      graph_data.key_entities,
-                "topics":        graph_data.primary_topics,
-                "summary":       graph_data.brief_summary,
-                "chunk_index":   i,
-                "original_content": {
-                    "raw_text":      content["text"],
-                    "tables_html":   content["tables"],
-                    "image_urls":    image_urls,
-                    "images_base64": image_b64_fallback,
-                },
+                "source": filename,
+                "file_hash": file_hash,
+                "document_type": graph_data.categories[0] if graph_data.categories else "General",
+                "categories": graph_data.categories,
+                "audience": graph_data.audience,
+                "topics": graph_data.primary_topics,
+                "summary": graph_data.brief_summary,
+                "chunk_index": i,
+                "original_content": json.dumps({
+                    "raw_text": content["text"],
+                    "tables_html": content["tables"],
+                    "images_base64": content["images"],
+                })
             },
         )
         docs.append(doc)
+        
+        unique_string = f"{file_hash}_chunk_{i}"
+        chunk_id = str(uuid.uuid5(NAMESPACE, unique_string))
         ids.append(chunk_id)
 
-    log.info("%d documents ready", len(docs))
+    print(f"  → {len(docs)} documents ready")
     return docs, ids
 
 
@@ -461,7 +504,8 @@ def run_ingestion(
             "The PDF appears blank or unreadable. "
             "If scanned, ensure tesseract-ocr is installed."
         )
-    text_chars = sum(len(el.text) for el in elements if hasattr(el, "text"))
+    # Added "and el.text" to ensure we don't call len() on None
+    text_chars = sum(len(el.text) for el in elements if hasattr(el, "text") and el.text)
     if text_chars < 50:
         raise ValueError(
             f"PDF contains almost no readable text ({text_chars} chars). "

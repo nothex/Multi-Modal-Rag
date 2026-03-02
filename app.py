@@ -210,50 +210,110 @@ if prompt := st.chat_input("Ask about your documents…"):
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
 
+                # if chunks:
+                #     with st.expander("🔍 Retrieved Sources", expanded=False):
+                #         for i, chunk in enumerate(chunks, 1):
+                #             meta     = chunk.metadata
+                #             original = meta.get("original_content")
+                #             if isinstance(original, str):
+                #                 try:
+                #                     original = json.loads(original)
+                #                 except Exception:
+                #                     original = {}
+                #             elif not isinstance(original, dict):
+                #                 original = {}
+
+                #             src   = meta.get("source", f"Document {i}")
+                #             cidx  = meta.get("chunk_index", "?")
+                #             dtype = meta.get("document_type", "unknown")
+
+                #             st.markdown(
+                #                 f"<div class='source-box'>"
+                #                 f"<b>[Source {i}]</b> {src} &nbsp;·&nbsp; chunk {cidx}"
+                #                 f" &nbsp;·&nbsp; <code>{dtype}</code></div>",
+                #                 unsafe_allow_html=True,
+                #             )
+                #             # Show a snippet of the raw text for transparency
+                #             raw_text = original.get("raw_text", chunk.page_content)
+                #             if raw_text:
+                #                 st.info(raw_text[:400] + ("…" if len(raw_text) > 400 else ""))
+
+                #             tables = original.get("tables_html", [])
+                #             if tables:
+                #                 st.write("📊 **Tables:**")
+                #                 for tbl in tables:
+                #                     st.markdown(tbl, unsafe_allow_html=True)
+
+                #             images_b64 = original.get("images_base64", [])
+                #             if images_b64:
+                #                 st.write("🖼️ **Images:**")
+                #                 for img_str in images_b64:
+                #                     # Use HTML/CSS to enforce a strict maximum height and perfect aspect ratio
+                #                     img_html = f'''
+                #                         <div style="text-align: center; margin-bottom: 15px; padding: 10px; background-color: #1e293b; border-radius: 8px;">
+                #                             <img src="data:image/jpeg;base64,{img_str}" 
+                #                                 style="max-width: 100%; max-height: 350px; object-fit: contain; border-radius: 4px;">
+                #                         </div>
+                #                     '''
+                #                     st.markdown(img_html, unsafe_allow_html=True)
+                #             st.divider()
+
+
+                
                 if chunks:
-                    with st.expander("🔍 Retrieved Sources", expanded=False):
-                        for i, chunk in enumerate(chunks, 1):
-                            meta     = chunk.metadata
-                            original = meta.get("original_content")
-                            if isinstance(original, str):
-                                try:
-                                    original = json.loads(original)
-                                except Exception:
-                                    original = {}
-                            elif not isinstance(original, dict):
-                                original = {}
+                    # 1. Collective Intelligence Indicator
+                    unique_sources = list(set([doc.metadata.get("source", "Unknown") for doc in chunks]))
+                    if len(unique_sources) > 1:
+                        st.success(f"💡 This answer was synthesized from **{len(unique_sources)} different documents**.")
+                    
+                    with st.expander("🔍 Verified Source Materials", expanded=False):
+                        # 2. Provenance Grouping (Organize by File)
+                        from collections import defaultdict
+                        grouped = defaultdict(list)
+                        for chunk in chunks:
+                            src = chunk.metadata.get("source", "Unknown")
+                            grouped[src].append(chunk)
 
-                            src   = meta.get("source", f"Document {i}")
-                            cidx  = meta.get("chunk_index", "?")
-                            dtype = meta.get("document_type", "unknown")
+                        for src, source_chunks in grouped.items():
+                            st.markdown(f"### 📄 {src}")
+                            
+                            for i, chunk in enumerate(source_chunks, 1):
+                                meta = chunk.metadata
+                                # Handle JSON string vs dict for original_content
+                                original = meta.get("original_content", "{}")
+                                if isinstance(original, str):
+                                    try: original = json.loads(original)
+                                    except: original = {}
+                                
+                                cidx = meta.get("chunk_index", "?")
+                                dtype = meta.get("document_type", "unknown")
 
-                            st.markdown(
-                                f"<div class='source-box'>"
-                                f"<b>[Source {i}]</b> {src} &nbsp;·&nbsp; chunk {cidx}"
-                                f" &nbsp;·&nbsp; <code>{dtype}</code></div>",
-                                unsafe_allow_html=True,
-                            )
+                                # Professional Citation Card
+                                st.markdown(
+                                    f"""<div style="border-left: 3px solid #10b981; padding: 10px; background: #1e293b; border-radius: 6px; margin-bottom: 10px;">
+                                        <span style="color: #34d399; font-weight: bold;">[Ref {i}]</span> 
+                                        <span style="color: #94a3b8; font-size: 0.85rem;">Chunk {cidx} • Category: {dtype}</span>
+                                    </div>""", 
+                                    unsafe_allow_html=True
+                                )
 
-                            raw_text = original.get("raw_text", chunk.page_content)
-                            if raw_text:
-                                st.info(raw_text[:400] + ("…" if len(raw_text) > 400 else ""))
+                                # Text Snippet
+                                raw_text = original.get("raw_text", chunk.page_content)
+                                if raw_text:
+                                    st.info(raw_text[:400] + ("…" if len(raw_text) > 400 else ""))
 
-                            tables = original.get("tables_html", [])
-                            if tables:
-                                st.write("📊 **Tables:**")
-                                for tbl in tables:
-                                    st.markdown(tbl, unsafe_allow_html=True)
-
-                            image_urls = original.get("image_urls", [])
-                            images_b64 = original.get("images_base64", [])
-                            if image_urls or images_b64:
-                                st.write("🖼️ **Images:**")
-                            for url in image_urls:
-                                st.image(url, use_container_width=True)
-                            for img_str in images_b64:
-                                st.image(base64.b64decode(img_str), use_container_width=True)
-
-                            st.divider()
-
+                                # Balanced Image Rendering
+                                images_b64 = original.get("images_base64", [])
+                                if images_b64:
+                                    for img_str in images_b64:
+                                        img_html = f'''
+                                            <div style="text-align: center; margin-bottom: 15px; padding: 10px; background-color: #0f172a; border-radius: 8px; border: 1px solid #334155;">
+                                                <img src="data:image/jpeg;base64,{img_str}" 
+                                                     style="max-width: 100%; max-height: 350px; object-fit: contain; border-radius: 4px;">
+                                            </div>
+                                        '''
+                                        st.markdown(img_html, unsafe_allow_html=True)
+                            
+                            st.divider() # Separate different PDFs
             except Exception as e:
                 st.error(f"Failed to generate answer: {e}")
