@@ -10,7 +10,11 @@ import queue
 import time
 
 import streamlit as st
-from auth import verify_password,get_daily_password
+
+import config
+from cl import run_ingestion, retrieve_chunks, generate_answer, get_existing_categories
+# FIX: import all three auth functions used in this file
+from auth import verify_password, get_daily_password, verify_admin_key
 
 st.set_page_config(page_title="Multimodal RAG", page_icon="🤖", layout="wide")
 
@@ -35,7 +39,7 @@ defaults = {
     "ingestion_step":    0,
     "ingestion_total":   5,
     "ingestion_result":  None,
-    "ingestion_queue":   None,   # queue.Queue instance, lives here so threads can write to it
+    "ingestion_queue":   None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -49,7 +53,7 @@ with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2103/2103633.png", width=80)
     with st.expander("🛠️ Admin Panel", expanded=False):
         admin_input = st.text_input("Master Admin Key", type="password", key="admin_key_input")
-        # FIX: use verify_admin_key() which uses hmac.compare_digest internally
+        # FIX: verify_admin_key is now properly imported above
         if admin_input and verify_admin_key(admin_input):
             daily_code = get_daily_password()
             st.success("Admin Verified ✅")
@@ -71,7 +75,7 @@ if not st.session_state.authenticated:
             st.rerun()
         else:
             st.error("Invalid code. Contact the administrator for today's code.")
-    st.stop()   # nothing below renders until authenticated
+    st.stop()
 
 
 # =========================================================================== #
@@ -80,16 +84,6 @@ if not st.session_state.authenticated:
 with st.sidebar:
     st.header("📄 Document Management")
     uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
-
-    # ── Ingestion with progress bar ───────────────────────────────────────
-    # WHY QUEUE, NOT SESSION_STATE IN THREAD:
-    # Streamlit session_state is NOT thread-safe. Writing to it from a
-    # background thread is silently dropped, leaving the UI stuck forever.
-    # The fix: the thread writes to a queue.Queue; the main thread drains
-    # it on every rerun via st.rerun(). The queue lives in session_state
-    # so it persists across reruns of the same session.
-    if "ingestion_queue" not in st.session_state:
-        st.session_state.ingestion_queue = None  # set when ingestion starts
 
     if st.button("⚙️ Process Document", use_container_width=True):
         if not uploaded_file:
@@ -102,7 +96,6 @@ with st.sidebar:
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getvalue())
 
-            # Create a fresh queue for this ingestion run
             q = queue.Queue()
             st.session_state.ingestion_queue   = q
             st.session_state.ingestion_running = True
@@ -113,13 +106,9 @@ with st.sidebar:
             def _run(path, q):
                 try:
                     def _progress_cb(step, total, msg):
-                        # Thread-safe: write to queue, NOT to session_state
                         q.put(("progress", step, total, msg))
-
                     doc_type = run_ingestion(
-                        path,
-                        export_json=False,
-                        force=False,
+                        path, export_json=False, force=False,
                         progress_callback=_progress_cb,
                     )
                     q.put(("done", doc_type))
@@ -132,10 +121,9 @@ with st.sidebar:
             threading.Thread(target=_run, args=(temp_path, q), daemon=True).start()
             st.rerun()
 
-    # Drain the queue on every rerun while ingestion is active
+    # Drain queue each rerun — thread-safe communication pattern
     if st.session_state.ingestion_running and st.session_state.ingestion_queue is not None:
         q = st.session_state.ingestion_queue
-        # Read all messages currently in the queue
         while not q.empty():
             msg = q.get_nowait()
             if msg[0] == "progress":
@@ -149,19 +137,15 @@ with st.sidebar:
                 st.session_state.ingestion_queue   = None
                 break
 
-        # Show progress bar
         step   = st.session_state.ingestion_step
         total  = st.session_state.ingestion_total
         status = st.session_state.ingestion_status
         st.progress(step / total if total else 0,
                     text=f"Step {step}/{total}: {status}")
         st.caption("Large PDFs can take several minutes…")
-
-        # Keep polling — rerun every 2 seconds
         time.sleep(2)
         st.rerun()
 
-    # Show result once done
     if not st.session_state.ingestion_running and st.session_state.ingestion_result is not None:
         result = st.session_state.ingestion_result
         if isinstance(result, Exception):
@@ -173,20 +157,17 @@ with st.sidebar:
             st.info("⏭️ Already ingested — skipped duplicate.")
         else:
             st.success(f"✅ Processed! Category: **{result}**")
-        st.session_state.ingestion_result = None  # clear so it doesn't re-flash
+        st.session_state.ingestion_result = None
 
-    # --- THE NEW GRAPH FILTER WIDGET ---
+    # FIX: live taxonomy from DB, NOT config.ALLOWED_CATEGORIES hardcoded list
     st.header("🎯 Search Filters")
-    st.markdown("Use AI-extracted metadata to narrow your search.")
-    
-    # Create a list of options: "All" plus the categories from your config
-    category_options = ["All"] + config.ALLOWED_CATEGORIES
-    
-    # The interactive dropdown
-    selected_category = st.selectbox(
-        "Filter by Document Type:", 
-        options=category_options,
-        index=0 # Defaults to "All"
+    live_cats   = get_existing_categories()
+    cat_options = ["All"] + live_cats
+    current     = st.session_state.selected_category
+    current_idx = cat_options.index(current) if current in cat_options else 0
+    # FIX: store result in session_state so queries actually use it
+    st.session_state.selected_category = st.selectbox(
+        "Filter by Document Type:", options=cat_options, index=current_idx
     )
 
     if st.button("🗑️ Clear Chat History", use_container_width=True):
@@ -208,7 +189,6 @@ with st.sidebar:
 st.title("🔮 Multimodal RAG Assistant")
 st.markdown("Ask questions about your PDFs — text, tables, and charts all understood.")
 
-# Replay history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -221,29 +201,19 @@ if prompt := st.chat_input("Ask about your documents…"):
     with st.chat_message("assistant"):
         with st.spinner("Searching and reading documents…"):
             try:
-                active_category = st.session_state.selected_category
-
-                # FIX: pass chat history for conversation memory
-                # Strip the current user message (last item) since it's the question
+                active_category    = st.session_state.selected_category
                 history_for_memory = st.session_state.messages[:-1]
 
-                chunks = retrieve_chunks(prompt, category=active_category)
-                response = generate_answer(
-                    chunks,
-                    prompt,
-                    chat_history=history_for_memory,
-                )
+                chunks   = retrieve_chunks(prompt, category=active_category)
+                response = generate_answer(chunks, prompt, chat_history=history_for_memory)
 
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
 
-                # ── Source viewer ─────────────────────────────────────────
                 if chunks:
                     with st.expander("🔍 Retrieved Sources", expanded=False):
                         for i, chunk in enumerate(chunks, 1):
-                            meta = chunk.metadata
-
-                            # FIX: original_content is now a real dict — no json.loads needed
+                            meta     = chunk.metadata
                             original = meta.get("original_content")
                             if isinstance(original, str):
                                 try:
@@ -259,8 +229,8 @@ if prompt := st.chat_input("Ask about your documents…"):
 
                             st.markdown(
                                 f"<div class='source-box'>"
-                                f"<b>[Source {i}]</b> {src} &nbsp;·&nbsp; chunk {cidx} &nbsp;·&nbsp; "
-                                f"<code>{dtype}</code></div>",
+                                f"<b>[Source {i}]</b> {src} &nbsp;·&nbsp; chunk {cidx}"
+                                f" &nbsp;·&nbsp; <code>{dtype}</code></div>",
                                 unsafe_allow_html=True,
                             )
 
@@ -274,17 +244,14 @@ if prompt := st.chat_input("Ask about your documents…"):
                                 for tbl in tables:
                                     st.markdown(tbl, unsafe_allow_html=True)
 
-                            # FIX: display from Storage URL if available, else base64 fallback
                             image_urls = original.get("image_urls", [])
                             images_b64 = original.get("images_base64", [])
-
                             if image_urls or images_b64:
                                 st.write("🖼️ **Images:**")
                             for url in image_urls:
                                 st.image(url, use_container_width=True)
                             for img_str in images_b64:
-                                img_bytes = base64.b64decode(img_str)
-                                st.image(img_bytes, use_container_width=True)
+                                st.image(base64.b64decode(img_str), use_container_width=True)
 
                             st.divider()
 

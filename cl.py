@@ -14,7 +14,6 @@ import logging
 import argparse
 import uuid
 import hashlib
-import hmac
 import time
 import re
 from typing import List, Optional, Tuple
@@ -37,8 +36,6 @@ load_dotenv()
 
 # =========================================================================== #
 #  STRUCTURED LOGGING                                                          #
-#  Replaces bare print() with timestamped levelled logs.                      #
-#  Set LOG_LEVEL=DEBUG in .env for verbose output during development.         #
 # =========================================================================== #
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -53,62 +50,61 @@ log = logging.getLogger("rag_pipeline")
 # =========================================================================== #
 
 class DocumentGraphMetadata(BaseModel):
-    """The structured schema for our Graph-Lite entity extraction."""
-    is_allowed: bool = Field(description="True if the document is a research paper, technical manual, or relevant policy. False if it is junk like an invoice or bill.")
-    document_type: str = Field(description="A 1-3 word classification of the document type.")
-    key_entities: List[str] = Field(description="Specific names of algorithms (e.g., 'Scaled Dot-Product'), organizations, technologies, or key people mentioned.")
-    primary_topics: List[str] = Field(description="The 2-3 broad themes of the document.")
-    brief_summary: str = Field(description="A one-sentence summary of what this document is about.")
+    """
+    Dynamic taxonomy classification.
+    All fields have safe defaults so partial LLM responses never raise.
+    categories/audience absorb extra fields older LLM versions return.
+    """
+    is_allowed: bool = Field(
+        default=True,
+        description=(
+            "True for any real document with meaningful content. "
+            "False ONLY for blank/empty files, pure spam, or completely unreadable content."
+        ),
+    )
+    document_type: str = Field(
+        default="general_document",
+        description=(
+            "A snake_case category label. Choose from the existing list if a good match exists. "
+            "Otherwise invent a concise new label e.g. 'machine_learning_paper', 'legal_contract'."
+        ),
+    )
+    key_entities: List[str] = Field(
+        default_factory=list,
+        description="Names of algorithms, people, organizations, places, or technologies mentioned.",
+    )
+    primary_topics: List[str] = Field(
+        default_factory=list,
+        description="The 2-3 broad themes of the document.",
+    )
+    brief_summary: str = Field(
+        default="No summary available.",
+        description="A one-sentence summary of what this document is about.",
+    )
+    # FIX: absorb extra fields older LLM responses include — prevents Pydantic crash
+    categories: Optional[List[str]] = Field(default=None, exclude=True)
+    audience:   Optional[str]       = Field(default=None, exclude=True)
+
 
 class QueryVariants(BaseModel):
-    """Schema for the Query Rewriter to output structured search queries."""
-    sub_queries: List[str] = Field(description="1 to 3 highly optimized, distinct search queries broken down from the original prompt.")
+    sub_queries: List[str] = Field(
+        description="1-3 highly optimized, distinct search queries broken down from the original prompt."
+    )
 
 
-def extract_document_entities(elements: list) -> DocumentGraphMetadata:
-    """
-    Reads the beginning of a document and extracts structured Graph-like metadata.
-    Acts as both a Bouncer and a Knowledge Extractor.
-    """
-    print("  🧠 Entity Extractor analyzing document structure...")
-    
-    # Grab the first ~2000 characters (Title, Abstract, Introduction)
-    sample_text = ""
-    for el in elements[:25]: 
-        sample_text += el.text + "\n"
-        if len(sample_text) > 2000:
-            break
-            
-    # We use Trinity or Llama 3 here because they are fast and great at JSON
-    llm = _build_llm(needs_vision=False) 
-    
-    # Force the LLM to output exactly our Pydantic schema
-    structured_llm = llm.with_structured_output(DocumentGraphMetadata)
-    
-    prompt = f"""Analyze the following text from the beginning of a document.
-Extract the key entities, topics, and determine if it belongs in a highly technical AI/Engineering knowledge base.
+# =========================================================================== #
+#  SHARED BUILDER HELPERS                                                      #
+# =========================================================================== #
 
-TEXT TO ANALYZE:
-{sample_text}
-"""
-    try:
-        # This returns a clean Python object, not a messy string!
-        extracted_data = structured_llm.invoke([HumanMessage(content=prompt)])
-        
-        print(f"  → Document Type: {extracted_data.document_type}")
-        print(f"  → Entities Found: {extracted_data.key_entities[:3]}...")
-        return extracted_data
-        
-    except Exception as e:
-        print(f"  ⚠ Extraction failed ({e}). Defaulting to rejection.")
-        # Fallback empty object that forces rejection
-        return DocumentGraphMetadata(
-            is_allowed=False, document_type="unknown", key_entities=[], primary_topics=[], brief_summary="Failed to parse."
-        )   
+def _build_llm(needs_vision: bool = False, use_classifier: bool = False) -> ChatOpenAI:
+    # FIX: was missing if/elif — model variable was undefined causing NameError
+    if use_classifier:
+        model = config.CLASSIFIER_LLM_MODEL
+    elif needs_vision:
+        model = config.VISION_LLM_MODEL
+    else:
+        model = config.TEXT_LLM_MODEL
 
-
-def _build_llm(needs_vision: bool = False) -> ChatOpenAI:
-    """Return the OpenRouter LLM defined in config."""
     return ChatOpenAI(
         model=model,
         openai_api_key=config.OPENROUTER_API_KEY,
@@ -132,10 +128,10 @@ def _build_supabase_client():
 
 
 def get_file_fingerprint(file_path: str) -> str:
-    """SHA-256 hash of file bytes (upgraded from MD5 — collision resistant)."""
+    """SHA-256 hash — collision-resistant dedup key."""
     hasher = hashlib.sha256()
     with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):   # stream in 64KB blocks
+        for chunk in iter(lambda: f.read(65536), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
 
@@ -145,11 +141,7 @@ def get_file_fingerprint(file_path: str) -> str:
 # =========================================================================== #
 
 def get_existing_categories() -> List[str]:
-    """
-    FIX: Now calls a lean SQL function that does DISTINCT server-side instead
-    of fetching every row and filtering in Python.
-    Falls back to empty list on any error.
-    """
+    """Server-side DISTINCT via get_document_types() SQL function."""
     supabase = _build_supabase_client()
     try:
         result = supabase.rpc("get_document_types", {}).execute()
@@ -171,7 +163,7 @@ def _sanitize_category(raw: str) -> str:
 
 
 # =========================================================================== #
-#  ENTITY EXTRACTION  (Classifier + Dynamic Taxonomy)                         #
+#  ENTITY EXTRACTION  (single definition — old duplicate removed)             #
 # =========================================================================== #
 
 def extract_document_entities(elements: list) -> DocumentGraphMetadata:
@@ -259,7 +251,8 @@ def _separate_content(chunk) -> dict:
                 data["types"].append("table")
                 data["tables"].append(getattr(el.metadata, "text_as_html", el.text))
             elif el_type == "Image":
-                if hasattr(el, "metadata") and hasattr(el.metadata, "image_base64") and el.metadata.image_base64:
+                if (hasattr(el, "metadata") and hasattr(el.metadata, "image_base64")
+                        and el.metadata.image_base64):
                     data["types"].append("image")
                     data["images"].append(el.metadata.image_base64)
     data["types"] = list(set(data["types"]))
@@ -267,27 +260,22 @@ def _separate_content(chunk) -> dict:
 
 
 def _upload_image_to_storage(image_b64: str, chunk_uuid: str, img_index: int) -> Optional[str]:
-    """
-    FIX: Upload base64 image to Supabase Storage instead of cramming it into JSONB.
-    Returns the public URL, or None if upload fails (fallback: keep base64).
-    Requires a public bucket named 'rag-images' in your Supabase project.
-    """
+    """Upload to Supabase Storage bucket 'rag-images'. Returns URL or None."""
     try:
-        import base64
-        supabase = _build_supabase_client()
-        img_bytes = base64.b64decode(image_b64)
-        path = f"{chunk_uuid}/img_{img_index}.jpg"
+        import base64 as b64lib
+        supabase  = _build_supabase_client()
+        img_bytes = b64lib.b64decode(image_b64)
+        path      = f"{chunk_uuid}/img_{img_index}.jpg"
         supabase.storage.from_("rag-images").upload(
             path=path,
             file=img_bytes,
             file_options={"content-type": "image/jpeg", "upsert": "true"},
         )
-        # Build public URL
         url = f"{config.SUPABASE_URL}/storage/v1/object/public/rag-images/{path}"
-        log.debug("Uploaded image to storage: %s", url)
+        log.debug("Uploaded image: %s", url)
         return url
     except Exception as exc:
-        log.warning("Image storage upload failed (%s). Keeping base64 in metadata.", exc)
+        log.warning("Image upload failed (%s). Keeping base64.", exc)
         return None
 
 
@@ -298,16 +286,19 @@ def _ai_summary(text: str, tables: List[str], images: List[str], max_retries: in
         for i, tbl in enumerate(tables, 1):
             prompt += f"Table {i}:\n{tbl}\n\n"
     prompt += (
-        "\nYOUR TASK:\nWrite a comprehensive, searchable description covering:\n"
+        "\nYOUR TASK:\nWrite a comprehensive searchable description covering:\n"
         "1. Key facts, numbers, and data points\n"
         "2. Main topics and concepts\n"
         "3. Questions this content could answer\n"
-        "4. Visual content analysis (charts, diagrams, patterns in images)\n"
+        "4. Visual content analysis (charts, diagrams, patterns)\n"
         "5. Alternative search terms\n\nSEARCHABLE DESCRIPTION:"
     )
     message_content: list = [{"type": "text", "text": prompt}]
     for img_b64 in images:
-        message_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+        message_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+        })
 
     for attempt in range(max_retries):
         try:
@@ -316,12 +307,12 @@ def _ai_summary(text: str, tables: List[str], images: List[str], max_retries: in
             return response.content
         except Exception as exc:
             err = str(exc)
-            log.warning("AI Summary attempt %d/%d failed: %s", attempt + 1, max_retries, err[:120])
+            log.warning("AI Summary attempt %d/%d: %s", attempt + 1, max_retries, err[:120])
             if "404" in err:
-                log.error("404: Vision endpoint unavailable — skipping retries.")
+                log.error("Vision endpoint 404 — skipping retries.")
                 break
             if attempt < max_retries - 1:
-                log.info("Waiting 5s before retry...")
+                log.info("Waiting 5s...")
                 time.sleep(5)
 
     summary = text[:300] + ("..." if len(text) > 300 else "")
@@ -336,21 +327,16 @@ def process_chunks(
     file_hash: str,
     graph_data: DocumentGraphMetadata,
 ) -> Tuple[List[Document], List[str]]:
-    """
-    FIX: original_content is now stored as a real nested dict (not json.dumps string).
-    Images are uploaded to Supabase Storage; only URLs stored in metadata.
-    """
     log.info("Processing %d chunks...", len(chunks))
-    docs: List[Document] = []
-    ids: List[str] = []
-    filename = os.path.basename(file_path)
+    docs:  List[Document] = []
+    ids:   List[str]      = []
+    filename  = os.path.basename(file_path)
     NAMESPACE = uuid.NAMESPACE_DNS
 
     for i, chunk in enumerate(chunks, 1):
-        content = _separate_content(chunk)
+        content  = _separate_content(chunk)
         chunk_id = str(uuid.uuid5(NAMESPACE, f"{file_hash}_chunk_{i}"))
 
-        # Upload images to Supabase Storage; store URLs instead of raw base64
         image_urls: List[str] = []
         image_b64_fallback: List[str] = []
         for j, img_b64 in enumerate(content["images"]):
@@ -358,12 +344,11 @@ def process_chunks(
             if url:
                 image_urls.append(url)
             else:
-                image_b64_fallback.append(img_b64)  # fallback: keep base64 if upload failed
+                image_b64_fallback.append(img_b64)
 
         has_rich = bool(content["tables"] or content["images"])
         if has_rich:
             log.info("[%d/%d] Rich chunk %s → AI summary", i, len(chunks), content["types"])
-            # Still pass raw b64 to the vision LLM for summarisation
             page_content = _ai_summary(content["text"], content["tables"], content["images"])
         else:
             log.info("[%d/%d] Text-only chunk", i, len(chunks))
@@ -379,20 +364,18 @@ def process_chunks(
                 "topics":        graph_data.primary_topics,
                 "summary":       graph_data.brief_summary,
                 "chunk_index":   i,
-                # FIX: store as a real nested dict, NOT json.dumps()
-                # This makes it queryable with Postgres JSONB operators.
                 "original_content": {
                     "raw_text":      content["text"],
                     "tables_html":   content["tables"],
-                    "image_urls":    image_urls,          # Supabase Storage URLs
-                    "images_base64": image_b64_fallback,  # only if upload failed
+                    "image_urls":    image_urls,
+                    "images_base64": image_b64_fallback,
                 },
             },
         )
         docs.append(doc)
         ids.append(chunk_id)
 
-    log.info("%d documents ready for upload", len(docs))
+    log.info("%d documents ready", len(docs))
     return docs, ids
 
 
@@ -413,30 +396,25 @@ def is_file_already_ingested(file_hash: str) -> bool:
 
 
 def upload_to_supabase(documents: List[Document], ids: List[str]) -> None:
-    """
-    FIX: Uploads in batches of UPLOAD_BATCH_SIZE with a small sleep between
-    batches to respect OpenRouter's free-tier rate limits.
-    """
-    BATCH_SIZE = config.UPLOAD_BATCH_SIZE  # default 10, configurable
-    BATCH_SLEEP = config.UPLOAD_BATCH_SLEEP_S  # default 2 seconds
+    """Batched upload — respects OpenRouter free-tier rate limits."""
+    BATCH_SIZE  = config.UPLOAD_BATCH_SIZE
+    BATCH_SLEEP = config.UPLOAD_BATCH_SLEEP_S
 
-    log.info("Embedding and uploading %d documents in batches of %d...", len(documents), BATCH_SIZE)
+    log.info("Uploading %d docs in batches of %d...", len(documents), BATCH_SIZE)
     vector_store = SupabaseVectorStore(
         embedding=_build_embeddings(),
         client=_build_supabase_client(),
         table_name=config.VECTOR_TABLE_NAME,
         query_name="match_documents",
     )
-
     total_batches = (len(documents) + BATCH_SIZE - 1) // BATCH_SIZE
     for batch_num, start in enumerate(range(0, len(documents), BATCH_SIZE), 1):
         batch_docs = documents[start : start + BATCH_SIZE]
         batch_ids  = ids[start : start + BATCH_SIZE]
-        log.info("Uploading batch %d/%d (%d docs)...", batch_num, total_batches, len(batch_docs))
+        log.info("Batch %d/%d (%d docs)...", batch_num, total_batches, len(batch_docs))
         vector_store.add_documents(batch_docs, ids=batch_ids)
-        if start + BATCH_SIZE < len(documents):   # don't sleep after the last batch
+        if start + BATCH_SIZE < len(documents):
             time.sleep(BATCH_SLEEP)
-
     log.info("Upload complete.")
 
 
@@ -458,13 +436,8 @@ def run_ingestion(
     pdf_path: str,
     export_json: bool = False,
     force: bool = False,
-    progress_callback=None,   # optional fn(step: int, total: int, msg: str)
+    progress_callback=None,
 ) -> str:
-    """
-    Returns the assigned document_type so the UI can display it.
-    progress_callback(step, total, message) is called at each major stage
-    so Streamlit (or a CLI) can show a progress bar.
-    """
     STEPS = 5
 
     def _progress(step: int, msg: str):
@@ -475,50 +448,39 @@ def run_ingestion(
     log.info("=" * 50)
     log.info("Starting ingestion: %s", pdf_path)
 
-    # ── Step 1: Fingerprint & dedup ──────────────────────────
     _progress(1, "Computing file fingerprint…")
     file_hash = get_file_fingerprint(pdf_path)
-    filename  = os.path.basename(pdf_path)
-
     if not force and is_file_already_ingested(file_hash):
-        log.info("SKIPPING — already ingested. Use force=True to re-process.")
+        log.info("SKIPPING — already ingested.")
         return "already_ingested"
 
-    # ── Step 2: Partition ────────────────────────────────────
     _progress(2, "Partitioning PDF (OCR + layout detection)…")
     elements = partition_document(pdf_path)
-
-    # FIX: explicit empty-document guard
     if not elements:
         raise ValueError(
-            "The PDF appears to be blank or unreadable — no content could be extracted. "
-            "If it's a scanned document, ensure tesseract-ocr is installed."
+            "The PDF appears blank or unreadable. "
+            "If scanned, ensure tesseract-ocr is installed."
         )
     text_chars = sum(len(el.text) for el in elements if hasattr(el, "text"))
     if text_chars < 50:
         raise ValueError(
-            f"The PDF contains almost no readable text ({text_chars} chars). "
-            "It may be a corrupted or image-only file without an OCR layer."
+            f"PDF contains almost no readable text ({text_chars} chars). "
+            "May be corrupted or image-only without OCR layer."
         )
 
-    # ── Step 3: Classify ─────────────────────────────────────
     _progress(3, "Classifying document and building taxonomy…")
     graph_data = extract_document_entities(elements)
-    
     if not graph_data.is_allowed:
-        print(f"\n❌ INGESTION ABORTED: Document '{filename}' was rejected by the system.")
-        print(f"Identified as: {graph_data.document_type}")
-        # If running in Streamlit, raise an error so the UI shows a red warning
-        raise ValueError(f"Document rejected. Identified as {graph_data.document_type}. Please upload a valid knowledge document.")
+        raise ValueError("Document rejected: appears blank, spam, or unreadable.")
+    log.info("Category: '%s'", graph_data.document_type)
 
-    # 5. Process and Upload (Passing the graph_data in!)
+    # FIX: step 4 was missing — progress bar skipped from 3 to 5
+    _progress(4, f"Chunking and processing (category: {graph_data.document_type})…")
     chunks = create_chunks(elements)
     docs, ids = process_chunks(chunks, pdf_path, file_hash, graph_data)
-
     if export_json:
         export_to_json(docs)
 
-    # ── Step 5: Upload ────────────────────────────────────────
     _progress(5, f"Embedding and uploading {len(docs)} chunks…")
     upload_to_supabase(docs, ids)
 
@@ -536,8 +498,8 @@ def generate_sub_queries(original_query: str) -> List[str]:
     structured_llm = llm.with_structured_output(QueryVariants)
     prompt = (
         "You are an expert search query optimiser.\n"
-        "Break the user's question into 1–3 distinct, targeted search queries.\n"
-        "If the question is simple, return just 1 optimised version. Do NOT answer the question.\n\n"
+        "Break the user's question into 1-3 distinct, targeted search queries.\n"
+        "If simple, return 1 optimised version. Do NOT answer it.\n\n"
         f"USER QUESTION: {original_query}"
     )
     try:
@@ -545,7 +507,7 @@ def generate_sub_queries(original_query: str) -> List[str]:
         log.info("%d sub-queries: %s", len(res.sub_queries), res.sub_queries)
         return res.sub_queries
     except Exception as exc:
-        log.warning("Rewriter failed (%s). Using original query.", exc)
+        log.warning("Rewriter failed (%s). Using original.", exc)
         return [original_query]
 
 
@@ -567,7 +529,7 @@ def retrieve_chunks(
         filter_dict["source"] = source_file
     if category and category != "All":
         filter_dict["document_type"] = category
-        print(f"  [!] Applying Hard Database Filter: Only searching '{category}' documents.")
+        log.info("Hard filter: document_type='%s'", category)
 
     all_candidates: list = []
     seen_ids: set = set()
@@ -586,7 +548,6 @@ def retrieve_chunks(
         except Exception as exc:
             log.error("RPC error for %r: %s", sub_query, exc)
             continue
-
         for chunk in (response.data or []):
             chunk_id = chunk.get("id")
             if chunk_id not in seen_ids:
@@ -594,18 +555,16 @@ def retrieve_chunks(
                 all_candidates.append(chunk)
 
     if not all_candidates:
-        log.warning("No chunks found across all sub-queries.")
+        log.warning("No chunks found.")
         return []
 
-    log.info("%d unique candidates — Cohere reranking...", len(all_candidates))
+    log.info("%d candidates — Cohere reranking...", len(all_candidates))
     co = cohere.Client(config.COHERE_API_KEY)
-    docs_to_rerank = [c["content"] for c in all_candidates]
-
     try:
         rerank_response = co.rerank(
             model="rerank-english-v3.0",
             query=query,
-            documents=docs_to_rerank,
+            documents=[c["content"] for c in all_candidates],
             top_n=dynamic_k,
         )
         retrieved = [
@@ -616,39 +575,32 @@ def retrieve_chunks(
             for r in rerank_response.results
         ]
     except Exception as exc:
-        log.warning("Cohere reranking failed (%s). Using raw order.", exc)
+        log.warning("Cohere failed (%s). Raw order.", exc)
         retrieved = [
             Document(page_content=c["content"], metadata=c.get("metadata", {}))
             for c in all_candidates[:dynamic_k]
         ]
 
-    log.info("Final %d chunks selected.", len(retrieved))
+    log.info("Final %d chunks.", len(retrieved))
     return retrieved
 
 
 # =========================================================================== #
-#  GENERATION  (with conversation memory + inline citations)                  #
+#  GENERATION                                                                  #
 # =========================================================================== #
 
 def generate_answer(
     chunks: List[Document],
     query: str,
-    chat_history: Optional[List[dict]] = None,   # [{"role": "user/assistant", "content": "..."}]
+    chat_history: Optional[List[dict]] = None,
 ) -> str:
-    """
-    FIX 1 — Conversation memory: last N turns of chat_history are prepended
-             so the LLM can answer follow-up questions correctly.
-    FIX 2 — Inline citations: the LLM is instructed to cite [Source N] and
-             the source filename is appended below the answer.
-    """
     if not chunks:
         return "No relevant documents were found for your query."
 
-    # Build conversation memory block (last 6 messages = 3 turns)
     memory_block = ""
     if chat_history:
         recent = chat_history[-6:]
-        memory_block = "CONVERSATION HISTORY (for context only — do not repeat):\n"
+        memory_block = "CONVERSATION HISTORY (context only):\n"
         for msg in recent:
             role = msg.get("role", "user").upper()
             memory_block += f"{role}: {msg.get('content', '')}\n"
@@ -656,27 +608,25 @@ def generate_answer(
 
     prompt = (
         "You are a highly intelligent, direct, and concise AI enterprise assistant.\n"
-        "Answer the user's question using ONLY the provided context below.\n\n"
-        "CRITICAL RULES:\n"
+        "Answer using ONLY the provided context.\n\n"
+        "RULES:\n"
         "1. Be direct and concise.\n"
-        "2. Cite your sources inline using [Source N] — e.g. 'The model uses 512 dimensions [Source 1].'\n"
+        "2. Cite inline: [Source N] e.g. 'Uses 512 dims [Source 1].'\n"
         "3. Answer all parts of a multi-part question.\n"
-        "4. If a specific detail is missing, say so only for that part.\n"
-        "5. If the entire context is irrelevant, say: 'I'm sorry, I don't have that information.'\n\n"
+        "4. If a detail is missing, say so only for that part.\n"
+        "5. If context is irrelevant: 'I'm sorry, I don't have that information.'\n\n"
         f"{memory_block}"
         f"QUESTION: {query}\n\nCONTEXT:\n"
     )
 
     all_images: List[str] = []
-    source_refs: List[str] = []   # for citation footer
+    source_refs: List[str] = []
 
     for i, chunk in enumerate(chunks, 1):
         prompt += f"--- Source {i} ---\n"
-        meta = chunk.metadata
-        # FIX: original_content is now a real dict, not a JSON string
+        meta     = chunk.metadata
         original = meta.get("original_content")
         if isinstance(original, str):
-            # Handle legacy string format gracefully
             try:
                 original = json.loads(original)
             except Exception:
@@ -687,16 +637,10 @@ def generate_answer(
         raw_text = original.get("raw_text", chunk.page_content)
         if raw_text:
             prompt += f"TEXT:\n{raw_text}\n\n"
-
         for j, tbl in enumerate(original.get("tables_html", []), 1):
             prompt += f"TABLE {j}:\n{tbl}\n\n"
 
-        # Collect images: prefer Storage URLs, fall back to base64
-        image_urls  = original.get("image_urls", [])
-        images_b64  = original.get("images_base64", [])
-        all_images.extend(images_b64)
-
-        # Build citation footer entry
+        all_images.extend(original.get("images_base64", []))
         source_name = meta.get("source", f"Document {i}")
         chunk_idx   = meta.get("chunk_index", "?")
         source_refs.append(f"[Source {i}] {source_name} (chunk {chunk_idx})")
@@ -705,13 +649,15 @@ def generate_answer(
 
     message_content: list = [{"type": "text", "text": prompt}]
     for img_b64 in all_images:
-        message_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+        message_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+        })
 
     llm = _build_llm(needs_vision=bool(all_images))
     try:
         response = llm.invoke([HumanMessage(content=message_content)])
         answer = response.content
-        # Append citation footer
         if source_refs:
             answer += "\n\n---\n**Sources:**\n" + "\n".join(source_refs)
         return answer
@@ -720,33 +666,19 @@ def generate_answer(
         return f"Failed to generate answer: {exc}"
 
 
-def run_query(query: str, k: int = 3, source_file: str = None, category: str = None,
-              chat_history: Optional[List[dict]] = None) -> str:
+def run_query(
+    query: str,
+    k: int = 3,
+    source_file: str = None,
+    category: str = None,
+    chat_history: Optional[List[dict]] = None,
+) -> str:
     chunks = retrieve_chunks(query, k=k, source_file=source_file, category=category)
     return generate_answer(chunks, query, chat_history=chat_history)
 
-def get_all_unique_categories() -> list:
-    """Fetches all unique category names from the database metadata."""
-    supabase = _build_supabase_client()
-    try:
-        # We fetch the metadata column from all documents
-        response = supabase.table(config.VECTOR_TABLE_NAME).select("metadata").execute()
-        
-        unique_cats = set()
-        for row in response.data:
-            meta = row.get("metadata", {})
-            # Get the categories list we stored
-            cats = meta.get("categories", [])
-            for c in cats:
-                unique_cats.add(c)
-        
-        return sorted(list(unique_cats))
-    except Exception as e:
-        print(f" ⚠️ Could not fetch categories: {e}")
-        return []
 
 # =========================================================================== #
-#  CLI ENTRY POINT                                                             #
+#  CLI                                                                         #
 # =========================================================================== #
 
 if __name__ == "__main__":
@@ -771,6 +703,6 @@ if __name__ == "__main__":
         print(f"\n💬 Answer:\n{answer}")
 
     if not args.ingest and not args.query:
-        demo = "What is the dimensionality (dmodel) used in the base Transformer model?"
+        demo = "What is the dimensionality used in the base Transformer model?"
         print(f"\n[Demo] {demo!r}")
         print(run_query(demo))
