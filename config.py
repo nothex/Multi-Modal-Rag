@@ -21,9 +21,9 @@ EMBEDDING_DIMENSIONS = 2048
 EMBEDDING_DEVICE     = "cuda"         # change to "cpu" if no NVIDIA GPU
 
 # ==================== LLM MODELS ====================
-VISION_LLM_MODEL     = "qwen/qwen3-vl-30b-a3b-thinking"          # balance: OCR + diagrams
-CLASSIFIER_LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"     # taxonomy + query rewriting
-TEXT_LLM_MODEL       = "arcee-ai/trinity-large-preview:free"         # final answer generation
+VISION_LLM_MODEL     = "qwen/qwen3-vl-30b-a3b-thinking"
+CLASSIFIER_LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+TEXT_LLM_MODEL       = "arcee-ai/trinity-large-preview:free"
 
 # ==================== OPENROUTER ====================
 OPENROUTER_API_KEY   = os.getenv("OPENROUTER_API_KEY")
@@ -41,6 +41,17 @@ UPLOAD_BATCH_SLEEP_S = 2     # seconds between batches
 
 # ==================== RETRIEVAL ====================
 CHAT_MEMORY_TURNS    = 3     # last N turns passed as memory to generate_answer
+
+# NEW: In-memory embedding cache max entries (each ~32 KB for 2048-dim)
+EMBEDDING_CACHE_SIZE = 256
+
+# NEW: Max chunks per source in a single retrieval result
+#      Prevents one PDF dominating all top-k slots.
+MAX_CHUNKS_PER_SOURCE = 2
+
+# NEW: Cohere relevance threshold — chunks below this score are dropped.
+#      0.35 is the sweet spot for rerank-english-v3.0.
+RELEVANCE_THRESHOLD  = 0.35
 
 # ==================== LOGGING ====================
 LOG_LEVEL            = os.getenv("LOG_LEVEL", "INFO")

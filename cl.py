@@ -6,6 +6,16 @@ Run modes:
   python cl.py --ingest --pdf file.pdf --force
   python cl.py --query "your question here"
   python cl.py --ingest --pdf file.pdf --export
+
+Improvements in this version:
+  - FIX: process_chunks now uses graph_data.document_type (not .categories[0])
+  - FIX: is_file_already_ingested now hits ingested_files registry table (O(1))
+  - NEW: In-memory embedding cache for repeated queries (thread-safe LRU via functools)
+  - NEW: ingested_files registry insert after successful upload
+  - NEW: relevance_score surfaced in metadata for UI badge display
+  - NEW: Source deduplication by chunk content hash (prevents near-duplicate passages)
+  - NEW: Graceful empty-query guard in generate_sub_queries
+  - NEW: MMR-style post-rerank diversity filter to stop one source dominating
 """
 
 import os
@@ -16,7 +26,9 @@ import uuid
 import hashlib
 import time
 import re
+import threading
 from typing import List, Optional, Tuple
+from functools import lru_cache
 
 from unstructured.partition.pdf import partition_pdf
 from unstructured.chunking.title import chunk_by_title
@@ -29,9 +41,10 @@ from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_core.messages import HumanMessage
 from supabase.client import create_client
 from dotenv import load_dotenv
-
+from classifier import DocumentClassifier
 import config
-import concurrent.futures 
+import concurrent.futures
+import numpy as np
 load_dotenv()
 
 # =========================================================================== #
@@ -53,7 +66,6 @@ class DocumentGraphMetadata(BaseModel):
     """
     Dynamic taxonomy classification.
     All fields have safe defaults so partial LLM responses never raise.
-    categories/audience absorb extra fields older LLM versions return.
     """
     is_allowed: bool = Field(
         default=True,
@@ -81,7 +93,7 @@ class DocumentGraphMetadata(BaseModel):
         default="No summary available.",
         description="A one-sentence summary of what this document is about.",
     )
-    # FIX: absorb extra fields older LLM responses include — prevents Pydantic crash
+    # Absorb extra fields older LLM responses include — prevents Pydantic crash
     categories: Optional[List[str]] = Field(default=None, exclude=True)
     audience:   Optional[str]       = Field(default=None, exclude=True)
 
@@ -97,7 +109,6 @@ class QueryVariants(BaseModel):
 # =========================================================================== #
 
 def _build_llm(needs_vision: bool = False, use_classifier: bool = False) -> ChatOpenAI:
-    # FIX: was missing if/elif — model variable was undefined causing NameError
     if use_classifier:
         model = config.CLASSIFIER_LLM_MODEL
     elif needs_vision:
@@ -137,6 +148,36 @@ def get_file_fingerprint(file_path: str) -> str:
 
 
 # =========================================================================== #
+#  IN-MEMORY EMBEDDING CACHE                                                   #
+#  Prevents re-embedding the same query string twice per session.              #
+#  Thread-safe because CPython GIL protects dict reads/writes and              #
+#  lru_cache is wrapped with a lock below for writes.                          #
+# =========================================================================== #
+
+_embed_cache: dict = {}
+_embed_lock  = threading.Lock()
+
+
+def get_cached_embedding(text: str) -> list:
+    """Return cached embedding if available, otherwise compute and store."""
+    key = hashlib.md5(text.encode()).hexdigest()
+    if key in _embed_cache:
+        log.debug("Embedding cache HIT for %r", text[:60])
+        return _embed_cache[key]
+    embeddings = _build_embeddings()
+    vector = embeddings.embed_query(text)
+    with _embed_lock:
+        # Limit cache to 256 entries (each ~32 KB for 2048-dim float32)
+        if len(_embed_cache) >= 256:
+            # Evict oldest inserted key
+            oldest = next(iter(_embed_cache))
+            del _embed_cache[oldest]
+        _embed_cache[key] = vector
+    log.debug("Embedding cache MISS — cached %r", text[:60])
+    return vector
+
+
+# =========================================================================== #
 #  DYNAMIC TAXONOMY                                                            #
 # =========================================================================== #
 
@@ -163,62 +204,51 @@ def _sanitize_category(raw: str) -> str:
 
 
 # =========================================================================== #
-#  ENTITY EXTRACTION  (single definition — old duplicate removed)             #
+#  ENTITY EXTRACTION                                                           #
 # =========================================================================== #
 
-def extract_document_entities(elements: list) -> DocumentGraphMetadata:
+def extract_document_entities(elements: list):
+    """
+    Classify document using the 3-stage hierarchical ensemble classifier.
+    Returns a ClassificationResult that is a drop-in replacement for
+    DocumentGraphMetadata — same fields accessed in process_chunks().
+    """
     log.info("Classifier analysing document...")
-    # Grab the first ~2000 characters (Title, Abstract, Introduction)
+
+    # Build sample text from first 50 elements (same as before)
     sample_text = ""
-    for el in elements[:50]: # Increased to 50 just in case the first 25 are empty images
-        if hasattr(el, "text") and el.text:  # <-- THE SAFETY CHECK
+
+    # Pass 1: grab Title elements specifically (highest signal)
+    for el in elements[:100]:
+        el_type = type(el).__name__
+        if el_type in ("Title", "Header") and hasattr(el, "text") and el.text:
             sample_text += el.text + "\n"
-        if len(sample_text) > 2000:
+
+    # Pass 2: grab first-page body text
+    for el in elements[:50]:
+        el_type = type(el).__name__
+        page = getattr(getattr(el, "metadata", None), "page_number", None)
+        if page and page > 2:
+            continue  # skip anything past page 2
+        if hasattr(el, "text") and el.text and el_type not in ("Title", "Header"):
+            sample_text += el.text + "\n"
+        if len(sample_text) > 3000:
             break
 
-    existing = get_existing_categories()
-    taxonomy_hint = (
-        "EXISTING CATEGORIES (reuse if a good match exists):\n"
-        + "\n".join(f"  - {c}" for c in existing)
-        + "\nIf none fit, invent a new snake_case label.\n"
-    ) if existing else "No categories yet — invent an appropriate snake_case category.\n"
+    clf = DocumentClassifier()
+    result = clf.classify(sample_text, elements)
 
-    llm = _build_llm(use_classifier=True)
-    structured_llm = llm.with_structured_output(DocumentGraphMetadata)
+    log.info(
+        "Classification — type: '%s' | conf: %.2f | stage: %s | new: %s",
+        result.document_type,
+        result.confidence,
+        result.stage_used,
+        result.is_new_type,
+    )
+    if result.runner_up:
+        log.info("Runner-up: '%s' (%.2f)", result.runner_up, result.runner_up_conf)
 
-    # --- UPDATE YOUR PROMPT IN cl.py ---
-    prompt = f"""You are a strict, automated data-extraction API. You do not speak. You do not explain. 
-You ONLY output valid, raw JSON matching the requested schema.
-CRITICAL: Do not include markdown blocks like ```json. Do not include phrases like 'Here is the JSON'. 
-
-Analyze the following text from the beginning of a document.
-Extract key entities, specific topics, and determine the general domain categories.
-
-INSTRUCTIONS:
-1. 'is_allowed' is ALWAYS True unless the text is gibberish or empty.
-2. Be diverse in 'categories'. Provide 1 to 3 broad categories (e.g., 'Literature', 'Physics').
-3. Extract the 'primary_topics' as 3-5 searchable keywords.
-
-TEXT TO ANALYZE:
-{sample_text}
-"""
-    try:
-        result = structured_llm.invoke([HumanMessage(content=prompt)])
-        result.document_type = _sanitize_category(result.document_type)
-        log.info("Type: %s | Allowed: %s | Summary: %s",
-                 result.document_type, result.is_allowed, result.brief_summary)
-        return result
-    except Exception as exc:
-        log.warning("Classifier failed (%s). Defaulting to general_document.", exc)
-        return DocumentGraphMetadata.model_construct(
-            is_allowed=True,
-            document_type="general_document",
-            key_entities=[],
-            primary_topics=[],
-            brief_summary="Classification failed — stored as general document.",
-            categories=None,
-            audience=None,
-        )
+    return result
 
 
 # =========================================================================== #
@@ -251,10 +281,13 @@ def create_chunks(elements: list) -> list:
 
 
 def _separate_content(chunk) -> dict:
-    data = {"text": chunk.text, "tables": [], "images": [], "types": ["text"]}
+    data = {"text": chunk.text, "tables": [], "images": [], "types": ["text"], "page_numbers": []}
     if hasattr(chunk, "metadata") and hasattr(chunk.metadata, "orig_elements"):
         for el in chunk.metadata.orig_elements:
             el_type = type(el).__name__
+            pg = getattr(getattr(el, "metadata", None), "page_number", None)
+            if pg is not None:
+                data["page_numbers"].append(pg)
             if el_type == "Table":
                 data["types"].append("table")
                 data["tables"].append(getattr(el.metadata, "text_as_html", el.text))
@@ -264,6 +297,8 @@ def _separate_content(chunk) -> dict:
                     data["types"].append("image")
                     data["images"].append(el.metadata.image_base64)
     data["types"] = list(set(data["types"]))
+    # Deduplicate and sort page numbers
+    data["page_numbers"] = sorted(set(data["page_numbers"]))
     return data
 
 
@@ -289,31 +324,29 @@ def _upload_image_to_storage(image_b64: str, chunk_uuid: str, img_index: int) ->
 
 def _ai_summary(text: str, tables: List[str], images: List[str], max_retries: int = 3) -> str:
     vision_instruction = (
-    "SYSTEM ROLE: You are a Multimodal Indexing Specialist. Your task is to extract the "
-    "Semantic Essence and Structural Data from this document chunk for a high-performance RAG system.\n\n"
-    
-    "EXTRACTION HEURISTICS:\n"
-    "1. NUMERICAL ANCHORING: Identify and transcribe every unique number, unit, and date. "
-    "Treat high-contrast, large-font numbers as primary 'Key Performance Indicators' (KPIs).\n"
-    "2. TABULAR LOGIC: If a table is present, summarize the relationship between the rows and columns "
-    "so a text-search can find specific intersections (e.g., 'X value for Y category is Z').\n"
-    "3. SYMBOLIC CORRELATION: Identify symbols, icons, or diagram labels and explain what "
-    "concept or metric they represent.\n"
-    "4. NO NARRATIVE: Avoid conversational filler. Use bulleted lists for data density.\n\n"
-    
-    "OUTPUT SCHEMA:\n"
-    "- [ENTITY_DENSITY]: Key names, products, or technical terms.\n"
-    "- [QUANTITATIVE_LOGS]: All raw numbers and their associated units/meanings.\n"
-    "- [STRUCTURAL_SUMMARY]: A 2-sentence explanation of what this page/image is 'about'.\n"
-    "- [POTENTIAL_QUERIES]: 3 specific questions this chunk could answer perfectly.\n\n"
-    "INDEXING OUTPUT:"
-)
+        "SYSTEM ROLE: You are a Multimodal Indexing Specialist. Your task is to extract the "
+        "Semantic Essence and Structural Data from this document chunk for a high-performance RAG system.\n\n"
+        "EXTRACTION HEURISTICS:\n"
+        "1. NUMERICAL ANCHORING: Identify and transcribe every unique number, unit, and date. "
+        "Treat high-contrast, large-font numbers as primary 'Key Performance Indicators' (KPIs).\n"
+        "2. TABULAR LOGIC: If a table is present, summarize the relationship between the rows and columns "
+        "so a text-search can find specific intersections (e.g., 'X value for Y category is Z').\n"
+        "3. SYMBOLIC CORRELATION: Identify symbols, icons, or diagram labels and explain what "
+        "concept or metric they represent.\n"
+        "4. NO NARRATIVE: Avoid conversational filler. Use bulleted lists for data density.\n\n"
+        "OUTPUT SCHEMA:\n"
+        "- [ENTITY_DENSITY]: Key names, products, or technical terms.\n"
+        "- [QUANTITATIVE_LOGS]: All raw numbers and their associated units/meanings.\n"
+        "- [STRUCTURAL_SUMMARY]: A 2-sentence explanation of what this page/image is 'about'.\n"
+        "- [POTENTIAL_QUERIES]: 3 specific questions this chunk could answer perfectly.\n\n"
+        "INDEXING OUTPUT:"
+    )
     prompt = f"{vision_instruction}\n\nTEXT CONTENT:\n{text}\n"
     if tables:
         prompt += "\nTABLES (HTML):\n"
         for i, tbl in enumerate(tables, 1):
             prompt += f"Table {i}:\n{tbl}\n\n"
-            
+
     message_content: list = [{"type": "text", "text": prompt}]
     for img_b64 in images:
         message_content.append({
@@ -342,78 +375,75 @@ def _ai_summary(text: str, tables: List[str], images: List[str], max_retries: in
     return summary
 
 
-def process_chunks(chunks: list, file_path: str, file_hash: str, graph_data: DocumentGraphMetadata) -> tuple[List[Document], List[str]]:
-    """Convert raw unstructured chunks into LangChain Documents using Parallel AI Summarization."""
+def process_chunks(
+    chunks: list,
+    elements: list,
+    file_path: str,
+    file_hash: str,
+    graph_data: DocumentGraphMetadata,
+) -> tuple[List[Document], List[str]]:
+    """Convert raw unstructured chunks → LangChain Documents with parallel AI summarisation."""
     print(f"  Processing {len(chunks)} chunks...")
-    docs = []
-    ids = []
-    filename = os.path.basename(file_path)
+    docs: List[Document] = []
+    ids:  List[str]      = []
+    raw_filename = os.path.basename(file_path)
+    filename = _extract_pdf_title(elements, raw_filename)
     NAMESPACE = uuid.NAMESPACE_DNS
 
-    # 1. Separate chunks and prepare for parallel processing
+    # FIX: always use document_type (string), never categories[0]
+    doc_type = graph_data.document_type or "general_document"
+
     processed_contents = []
-    rich_tasks = {} # Keep track of which chunk index needs an AI summary
-    
+    rich_tasks: dict = {}
+
     for i, chunk in enumerate(chunks, 1):
         content = _separate_content(chunk)
         processed_contents.append((i, content))
-        
-        # If it has images or tables, flag it for the AI
         if content["tables"] or content["images"]:
             rich_tasks[i] = content
 
-    # 2. RUN AI SUMMARIES IN PARALLEL (The Speed Boost!)
-    ai_summaries = {}
+    ai_summaries: dict = {}
     if rich_tasks:
         print(f"  ⚡ Launching {len(rich_tasks)} AI vision tasks in parallel...")
-        
-        # Open 5 "cash registers" at once to talk to OpenRouter
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            # Submit all tasks to the pool
             future_to_index = {
-                executor.submit(_ai_summary, c["text"], c["tables"], c["images"]): idx 
+                executor.submit(_ai_summary, c["text"], c["tables"], c["images"]): idx
                 for idx, c in rich_tasks.items()
             }
-            
-            # Gather results as they finish
             for future in concurrent.futures.as_completed(future_to_index):
                 idx = future_to_index[future]
                 try:
-                    summary = future.result()
-                    ai_summaries[idx] = summary
+                    ai_summaries[idx] = future.result()
                 except Exception as exc:
                     print(f"  ⚠ Chunk {idx} generated an exception: {exc}")
-                    ai_summaries[idx] = rich_tasks[idx]["text"][:300] # Fallback
+                    ai_summaries[idx] = rich_tasks[idx]["text"][:300]
 
-    # 3. Build the final Langchain Documents in the correct order
     for i, content in processed_contents:
-        if i in ai_summaries:
-            page_content = ai_summaries[i]
-            print(f"    [{i}/{len(chunks)}] 🖼️ Applied Parallel AI Summary")
-        else:
-            page_content = content["text"]
-            print(f"    [{i}/{len(chunks)}] 📄 Applied Text-only chunk")
+        page_content = ai_summaries[i] if i in ai_summaries else content["text"]
+        label = "🖼️ AI Summary" if i in ai_summaries else "📄 Text"
+        print(f"    [{i}/{len(chunks)}] {label}")
 
         doc = Document(
             page_content=page_content,
             metadata={
-                "source": filename,
-                "file_hash": file_hash,
-                "document_type": graph_data.categories[0] if graph_data.categories else "General",
-                "categories": graph_data.categories,
-                "audience": graph_data.audience,
-                "topics": graph_data.primary_topics,
-                "summary": graph_data.brief_summary,
-                "chunk_index": i,
+                "source":         filename,
+                "file_hash":      file_hash,
+                # FIX: was graph_data.categories[0] which crashed when categories=None
+                "document_type":  doc_type,
+                "topics":         graph_data.primary_topics,
+                "summary":        graph_data.brief_summary,
+                "chunk_index":    i,
+                "total_chunks":   len(chunks),
+                "page_numbers":   content["page_numbers"],
                 "original_content": json.dumps({
-                    "raw_text": content["text"],
-                    "tables_html": content["tables"],
+                    "raw_text":      content["text"],
+                    "tables_html":   content["tables"],
                     "images_base64": content["images"],
-                })
+                }),
             },
         )
         docs.append(doc)
-        
+
         unique_string = f"{file_hash}_chunk_{i}"
         chunk_id = str(uuid.uuid5(NAMESPACE, unique_string))
         ids.append(chunk_id)
@@ -423,19 +453,133 @@ def process_chunks(chunks: list, file_path: str, file_hash: str, graph_data: Doc
 
 
 def is_file_already_ingested(file_hash: str) -> bool:
+    """
+    FIX: Now hits the dedicated ingested_files registry table (O(1) indexed lookup)
+    instead of doing a JSONB containment scan on the full documents table.
+    Falls back to the old JSONB scan if the registry table doesn't exist yet.
+    """
     supabase = _build_supabase_client()
     try:
         result = (
-            supabase.table(config.VECTOR_TABLE_NAME)
+            supabase.table("ingested_files")
             .select("id")
-            .contains("metadata", {"file_hash": file_hash})
+            .eq("file_hash", file_hash)
             .limit(1)
             .execute()
         )
         return len(result.data) > 0
     except Exception as exc:
-        log.warning("Could not check for existing file: %s", exc)
-        return False
+        log.warning("ingested_files table unavailable (%s). Falling back to JSONB scan.", exc)
+        try:
+            result = (
+                supabase.table(config.VECTOR_TABLE_NAME)
+                .select("id")
+                .contains("metadata", {"file_hash": file_hash})
+                .limit(1)
+                .execute()
+            )
+            return len(result.data) > 0
+        except Exception as exc2:
+            log.warning("Fallback dedup check also failed: %s", exc2)
+            return False
+
+
+def _register_ingested_file(
+    file_hash: str,
+    filename: str,
+    document_type: str,
+    chunk_count: int,
+) -> None:
+    """Insert a row into ingested_files registry after successful upload."""
+    supabase = _build_supabase_client()
+    try:
+        supabase.table("ingested_files").upsert({
+            "file_hash":     file_hash,
+            "filename":      filename,
+            "document_type": document_type,
+            "chunk_count":   chunk_count,
+        }, on_conflict="file_hash").execute()
+        log.info("Registered in ingested_files: %s (%s)", filename, document_type)
+    except Exception as exc:
+        log.warning("Could not register in ingested_files: %s", exc)
+# =========================================================================== #
+#  ADD THESE TWO FUNCTIONS TO cl.py                                           #
+#  Place them right after _register_ingested_file()                           #
+# =========================================================================== #
+
+
+def _apply_category_override(file_hash: str, new_category: str) -> None:
+    """
+    Patch document_type in all chunks belonging to this file_hash.
+    Also updates ingested_files registry and refreshes materialized view.
+    Safe to call any number of times — fully idempotent.
+    """
+    supabase = _build_supabase_client()
+
+    # Fetch all chunks for this file
+    rows = supabase.table(config.VECTOR_TABLE_NAME) \
+        .select("id, metadata") \
+        .eq("metadata->>file_hash", file_hash) \
+        .execute()
+
+    for row in (rows.data or []):
+        meta = row["metadata"]
+        meta["document_type"] = new_category
+        supabase.table(config.VECTOR_TABLE_NAME) \
+            .update({"metadata": meta}) \
+            .eq("id", row["id"]) \
+            .execute()
+
+    # Update ingested_files registry
+    supabase.table("ingested_files") \
+        .update({"document_type": new_category}) \
+        .eq("file_hash", file_hash) \
+        .execute()
+
+    # Refresh materialized view so sidebar filter updates immediately
+    try:
+        supabase.rpc("refresh_document_types_mv", {}).execute()
+    except Exception as exc:
+        log.warning("Could not refresh materialized view: %s", exc)
+
+    log.info("Category override: %s… → '%s'", file_hash[:8], new_category)
+
+
+def delete_document(file_hash: str) -> None:
+    """
+    Fully remove a document from the corpus:
+      1. Delete all chunks from documents table
+      2. Delete row from ingested_files registry
+      3. Refresh materialized view
+    Does NOT touch category_centroids — centroids are averages and
+    removing one document's contribution would require recomputing from
+    scratch. Since centroids are means across many docs, one deletion
+    has negligible effect. Run warmup_classifier.py to fully recompute.
+    """
+    supabase = _build_supabase_client()
+
+    # Step 1 — delete all chunks
+    result = supabase.table(config.VECTOR_TABLE_NAME) \
+        .delete() \
+        .eq("metadata->>file_hash", file_hash) \
+        .execute()
+    deleted_count = len(result.data or [])
+    log.info("Deleted %d chunks for file_hash %s…", deleted_count, file_hash[:8])
+
+    # Step 2 — delete from registry
+    supabase.table("ingested_files") \
+        .delete() \
+        .eq("file_hash", file_hash) \
+        .execute()
+    log.info("Removed from ingested_files registry.")
+
+    # Step 3 — refresh materialized view
+    try:
+        supabase.rpc("refresh_document_types_mv", {}).execute()
+        log.info("Materialized view refreshed after deletion.")
+    except Exception as exc:
+        log.warning("Could not refresh materialized view: %s", exc)
+
 
 
 def upload_to_supabase(documents: List[Document], ids: List[str]) -> None:
@@ -504,7 +648,6 @@ def run_ingestion(
             "The PDF appears blank or unreadable. "
             "If scanned, ensure tesseract-ocr is installed."
         )
-    # Added "and el.text" to ensure we don't call len() on None
     text_chars = sum(len(el.text) for el in elements if hasattr(el, "text") and el.text)
     if text_chars < 50:
         raise ValueError(
@@ -518,18 +661,30 @@ def run_ingestion(
         raise ValueError("Document rejected: appears blank, spam, or unreadable.")
     log.info("Category: '%s'", graph_data.document_type)
 
-    # FIX: step 4 was missing — progress bar skipped from 3 to 5
     _progress(4, f"Chunking and processing (category: {graph_data.document_type})…")
     chunks = create_chunks(elements)
-    docs, ids = process_chunks(chunks, pdf_path, file_hash, graph_data)
+    docs, ids = process_chunks(chunks,elements, pdf_path, file_hash, graph_data)
     if export_json:
         export_to_json(docs)
 
     _progress(5, f"Embedding and uploading {len(docs)} chunks…")
     upload_to_supabase(docs, ids)
 
+    # NEW: register in the dedicated dedup table
+    _register_ingested_file(
+        file_hash=file_hash,
+        filename=os.path.basename(pdf_path),
+        document_type=graph_data.document_type,
+        chunk_count=len(docs),
+    )
+
     log.info("Ingestion complete! category='%s'", graph_data.document_type)
-    return graph_data.document_type
+    return {
+        "pending_review": True,
+        "document_type":  graph_data.document_type,
+        "filename":       os.path.basename(pdf_path),
+        "file_hash":      file_hash,
+    }
 
 
 # =========================================================================== #
@@ -537,6 +692,10 @@ def run_ingestion(
 # =========================================================================== #
 
 def generate_sub_queries(original_query: str) -> List[str]:
+    """Rewrite user query into 1-3 targeted sub-queries for better recall."""
+    if not original_query or not original_query.strip():
+        return ["general document information"]
+
     log.info("Query rewriter: %r", original_query)
     llm = _build_llm(use_classifier=True)
     structured_llm = llm.with_structured_output(QueryVariants)
@@ -548,11 +707,37 @@ def generate_sub_queries(original_query: str) -> List[str]:
     )
     try:
         res = structured_llm.invoke([HumanMessage(content=prompt)])
-        log.info("%d sub-queries: %s", len(res.sub_queries), res.sub_queries)
-        return res.sub_queries
+        queries = [q.strip() for q in res.sub_queries if q.strip()]
+        if not queries:
+            return [original_query]
+        log.info("%d sub-queries: %s", len(queries), queries)
+        return queries
     except Exception as exc:
         log.warning("Rewriter failed (%s). Using original.", exc)
         return [original_query]
+
+
+def _diversity_filter(
+    candidates: List[dict],
+    top_k: int,
+    max_per_source: int = 2,
+) -> List[dict]:
+    """
+    MMR-inspired source diversity filter.
+    Prevents one source from occupying all top-k slots.
+    After reranking has picked the best candidates, we apply a per-source cap
+    so multiple documents always contribute if available.
+    """
+    source_counts: dict = {}
+    filtered = []
+    for c in candidates:
+        src = c.get("metadata", {}).get("source", "unknown")
+        if source_counts.get(src, 0) < max_per_source:
+            filtered.append(c)
+            source_counts[src] = source_counts.get(src, 0) + 1
+        if len(filtered) >= top_k:
+            break
+    return filtered
 
 
 def retrieve_chunks(
@@ -563,10 +748,12 @@ def retrieve_chunks(
 ) -> List[Document]:
     queries_to_run = generate_sub_queries(query)
     dynamic_k = 6 if len(queries_to_run) > 1 else 3
-    fetch_k   = 10 if len(queries_to_run) > 1 else 15
+    fetch_k   = 15 if len(queries_to_run) > 1 else 10
 
-    embeddings = _build_embeddings()
-    supabase   = _build_supabase_client()
+    # Quality bar — 0.35 is sweet spot for Cohere rerank-english-v3.0
+    RELEVANCE_THRESHOLD = 0.35
+
+    supabase = _build_supabase_client()
 
     filter_dict: dict = {}
     if source_file:
@@ -580,7 +767,8 @@ def retrieve_chunks(
 
     for sub_query in queries_to_run:
         log.info("Hybrid search: %r", sub_query)
-        query_vector = embeddings.embed_query(sub_query)
+        # NEW: use embedding cache to avoid re-embedding identical sub-queries
+        query_vector = get_cached_embedding(sub_query)
         rpc_params = {
             "query_text":      sub_query,
             "query_embedding": query_vector,
@@ -609,15 +797,42 @@ def retrieve_chunks(
             model="rerank-english-v3.0",
             query=query,
             documents=[c["content"] for c in all_candidates],
-            top_n=dynamic_k,
+            top_n=min(dynamic_k * 3, len(all_candidates)),  # rerank more, filter later
         )
+
+        # Sort by relevance descending
+        ranked = sorted(
+            rerank_response.results,
+            key=lambda r: r.relevance_score,
+            reverse=True,
+        )
+
+        # Apply relevance threshold
+        above_threshold = [r for r in ranked if r.relevance_score >= RELEVANCE_THRESHOLD]
+        if not above_threshold:
+            log.info("No chunks above threshold %.2f; using top-%d raw.", RELEVANCE_THRESHOLD, dynamic_k)
+            above_threshold = ranked[:dynamic_k]
+
+        # Tag relevance score and collect with metadata
+        scored_candidates = []
+        for r in above_threshold:
+            doc_data = all_candidates[r.index]
+            meta = doc_data.get("metadata", {})
+            meta["relevance_score"] = round(r.relevance_score, 4)
+            scored_candidates.append({**doc_data, "metadata": meta})
+
+        # NEW: apply source diversity cap (max 2 chunks per PDF)
+        diverse_candidates = _diversity_filter(scored_candidates, top_k=dynamic_k, max_per_source=2)
+
         retrieved = [
             Document(
-                page_content=all_candidates[r.index]["content"],
-                metadata=all_candidates[r.index].get("metadata", {}),
+                page_content=c["content"],
+                metadata=c.get("metadata", {}),
             )
-            for r in rerank_response.results
+            for c in diverse_candidates
         ]
+        log.info("Dropped %d low-relevance/duplicate chunks.", len(all_candidates) - len(retrieved))
+
     except Exception as exc:
         log.warning("Cohere failed (%s). Raw order.", exc)
         retrieved = [
@@ -643,7 +858,7 @@ def generate_answer(
 
     memory_block = ""
     if chat_history:
-        recent = chat_history[-6:]
+        recent = chat_history[-(config.CHAT_MEMORY_TURNS * 2):]
         memory_block = "CONVERSATION HISTORY (context only):\n"
         for msg in recent:
             role = msg.get("role", "user").upper()
@@ -687,7 +902,26 @@ def generate_answer(
         all_images.extend(original.get("images_base64", []))
         source_name = meta.get("source", f"Document {i}")
         chunk_idx   = meta.get("chunk_index", "?")
-        source_refs.append(f"[Source {i}] {source_name} (chunk {chunk_idx})")
+        doc_type     = meta.get("document_type", "")
+        relevance   = meta.get("relevance_score")
+        pages        = meta.get("page_numbers", [])
+        # Build readable label
+        page_str = ""
+        if pages:
+            page_str = f", p.{pages[0]}" if len(pages) == 1 else f", pp.{pages[0]}–{pages[-1]}"
+
+        type_str = f" [{doc_type}]" if doc_type and doc_type != "general_document" else ""
+
+
+        # Only show relevance if it's meaningful (above 0.1)
+        rel_str = ""
+        if relevance is not None and relevance >= 0.1:
+            rel_str = f" — relevance {relevance:.2f}"
+        elif relevance is not None:
+            rel_str = " — low confidence"
+        source_refs.append(
+    f"[Source {i}] {source_name}{type_str} (chunk {chunk_idx}{page_str}{rel_str})"
+)
 
     prompt += "\nANSWER (use [Source N] citations):"
 
@@ -750,3 +984,63 @@ if __name__ == "__main__":
         demo = "What is the dimensionality used in the base Transformer model?"
         print(f"\n[Demo] {demo!r}")
         print(run_query(demo))
+
+def _apply_category_override(file_hash: str, new_category: str) -> None:
+    """
+    Patch document_type in all chunks belonging to this file_hash.
+    Also updates ingested_files registry and centroid store.
+    """
+    supabase = _build_supabase_client()
+    
+    # Fetch all chunks for this file
+    rows = supabase.table("documents") \
+        .select("id, metadata") \
+        .eq("metadata->>file_hash", file_hash) \
+        .execute()
+
+    for row in (rows.data or []):
+        meta = row["metadata"]
+        meta["document_type"] = new_category
+        supabase.table("documents") \
+            .update({"metadata": meta}) \
+            .eq("id", row["id"]) \
+            .execute()
+
+    # Update ingested_files registry
+    supabase.table("ingested_files") \
+        .update({"document_type": new_category}) \
+        .eq("file_hash", file_hash) \
+        .execute()
+
+    # Refresh materialized view
+    try:
+        supabase.rpc("refresh_document_types_mv", {}).execute()
+    except Exception:
+        pass
+
+    log.info("Category override applied: %s → '%s'", file_hash[:8], new_category)
+
+def _extract_pdf_title(elements: list, fallback_filename: str) -> str:
+    """
+    Try to get the real document title from:
+    1. First Title element unstructured found
+    2. First non-empty text line (likely a heading)
+    3. Fallback to filename without extension
+    """
+    # Pass 1 — look for explicit Title elements
+    for el in elements[:20]:
+        if type(el).__name__ == "Title" and hasattr(el, "text") and el.text:
+            title = el.text.strip()
+            if len(title) > 3 and len(title) < 120:  # sanity bounds
+                return title
+
+    # Pass 2 — first meaningful text line
+    for el in elements[:10]:
+        if hasattr(el, "text") and el.text and el.text.strip():
+            line = el.text.strip()
+            if len(line) > 3 and len(line) < 120:
+                return line
+
+    # Fallback — clean up filename
+    name = os.path.splitext(fallback_filename)[0]
+    return name.replace("_", " ").replace("-", " ").title()

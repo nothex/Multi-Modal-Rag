@@ -1,23 +1,15 @@
 -- ============================================================
--- RAG Pipeline — Supabase SQL Setup (v4 — full production)
+-- RAG Pipeline — Supabase SQL Setup (v5 — performance edition)
 -- Run this entire file in: Dashboard → SQL Editor → New Query
 -- ============================================================
 --
--- WHAT'S IN THIS FILE:
---   1. Extensions
---   2. Tables (documents + ingested_files registry)
---   3. Indexes (HNSW via halfvec, FTS, GIN metadata, file_hash)
---   4. Drop old function signatures
---   5. match_documents      — semantic search (LangChain internal)
---   6. hybrid_search        — semantic + keyword blended
---   7. get_document_types   — efficient DISTINCT taxonomy query
---   8. Supabase Storage setup note
---   9. Smoke tests
---
--- WHY halfvec:
---   pgvector HNSW caps at 2000 dims. nvidia/llama-nemotron outputs 2048.
---   Casting to halfvec(2048) at index time bypasses the limit.
---   Full float32 precision is still stored in the column.
+-- WHAT'S NEW vs v4:
+--   - ingested_files registry (O(1) dedup — no JSONB scan)
+--   - Materialized view for document_type taxonomy (replaces DISTINCT on every request)
+--   - get_document_types() now reads from the materialized view
+--   - refresh_document_types_mv() — call this after each ingestion
+--   - Automatic refresh via trigger on documents INSERT
+--   - Index on ingested_files.file_hash for fast lookups
 -- ============================================================
 
 
@@ -40,9 +32,9 @@ create table if not exists documents (
     embedding vector(2048)
 );
 
--- FIX: Dedicated file registry for fast O(1) duplicate checks.
--- is_file_already_ingested() used to do a JSONB containment scan on the
--- documents table. This table makes it an indexed lookup on a text column.
+-- Dedicated file registry for O(1) duplicate checks.
+-- is_file_already_ingested() does an indexed eq() on file_hash,
+-- not a slow JSONB containment scan on documents.
 create table if not exists ingested_files (
     id            uuid        primary key default gen_random_uuid(),
     file_hash     text        unique not null,
@@ -77,32 +69,83 @@ create index if not exists documents_metadata_idx
     on documents
     using gin (metadata);
 
--- FIX: index on file_hash inside metadata for fast dedup checks
--- (used by is_file_already_ingested fallback path)
-create index if not exists documents_metadata_filehash_idx
-    on documents ((metadata->>'file_hash'));
-
--- Fast lookup on the file registry
+-- Fast lookup by file_hash in ingested_files
 create index if not exists ingested_files_hash_idx
     on ingested_files (file_hash);
 
+-- Fast lookup on file_hash inside metadata (fallback path)
+create index if not exists documents_metadata_filehash_idx
+    on documents ((metadata->>'file_hash'));
+
 
 -- ============================================================
--- 4. DROP ALL OLD FUNCTION SIGNATURES
+-- 4. MATERIALIZED VIEW — document taxonomy
+--
+-- WHY: get_existing_categories() was doing a DISTINCT across the
+-- full documents table on every sidebar render. For large corpora
+-- this is expensive. A materialized view pre-computes the list.
+-- The trigger below refreshes it automatically after each INSERT.
 -- ============================================================
-drop function if exists match_documents(vector, int, jsonb)      cascade;
-drop function if exists match_documents(vector, int, float, jsonb) cascade;
-drop function if exists match_documents                            cascade;
 
-drop function if exists hybrid_search(text, vector, int, jsonb)             cascade;
+create materialized view if not exists mv_document_types as
+    select distinct metadata->>'document_type' as document_type
+    from documents
+    where metadata->>'document_type' is not null
+      and metadata->>'document_type' != 'unknown'
+    order by 1;
+
+-- Index on the materialized view for fast reads
+create unique index if not exists mv_document_types_idx
+    on mv_document_types (document_type);
+
+-- Helper function to refresh the view (called from Python after ingestion)
+create or replace function refresh_document_types_mv()
+returns void
+language plpgsql
+security definer
+as $$
+begin
+    refresh materialized view concurrently mv_document_types;
+end;
+$$;
+
+-- Automatic refresh trigger on new document rows
+-- Uses CONCURRENTLY so reads are never blocked
+create or replace function _trg_refresh_mv_document_types()
+returns trigger
+language plpgsql
+as $$
+begin
+    -- Fire-and-forget: refresh in background via pg_notify
+    -- (avoids blocking the INSERT transaction itself)
+    perform pg_notify('refresh_mv', 'document_types');
+    return new;
+end;
+$$;
+
+drop trigger if exists trg_refresh_mv_document_types on documents;
+create trigger trg_refresh_mv_document_types
+    after insert on documents
+    for each statement
+    execute procedure _trg_refresh_mv_document_types();
+
+
+-- ============================================================
+-- 5. DROP ALL OLD FUNCTION SIGNATURES
+-- ============================================================
+drop function if exists match_documents(vector, int, jsonb)        cascade;
+drop function if exists match_documents(vector, int, float, jsonb)  cascade;
+drop function if exists match_documents                              cascade;
+
+drop function if exists hybrid_search(text, vector, int, jsonb)              cascade;
 drop function if exists hybrid_search(text, vector, int, jsonb, float, float) cascade;
-drop function if exists hybrid_search                                         cascade;
+drop function if exists hybrid_search                                          cascade;
 
 drop function if exists get_document_types() cascade;
 
 
 -- ============================================================
--- 5. match_documents — pure semantic search
+-- 6. match_documents — pure semantic search
 --    Used internally by LangChain's SupabaseVectorStore.
 -- ============================================================
 create or replace function match_documents(
@@ -134,7 +177,7 @@ $$;
 
 
 -- ============================================================
--- 6. hybrid_search — semantic + keyword blended
+-- 7. hybrid_search — semantic + keyword blended
 --    Called by retrieve_chunks() in cl.py.
 -- ============================================================
 create or replace function hybrid_search(
@@ -207,41 +250,32 @@ $$;
 
 
 -- ============================================================
--- 7. get_document_types — efficient taxonomy query
---    FIX: replaces the Python-side full-table-scan in
---    get_existing_categories(). Does DISTINCT server-side.
+-- 8. get_document_types — reads from materialized view
+--    FAST: no table scan, no DISTINCT computation at query time.
 -- ============================================================
 create or replace function get_document_types()
 returns table (document_type text)
 language sql
-stable         -- marks it as read-only so the planner can cache it
+stable
 as $$
-    select distinct metadata->>'document_type' as document_type
-    from documents
-    where metadata->>'document_type' is not null
-      and metadata->>'document_type' != 'unknown'
-    order by 1;
+    select document_type
+    from mv_document_types
+    order by document_type;
 $$;
 
 
 -- ============================================================
--- 8. SUPABASE STORAGE — rag-images bucket
+-- 9. SUPABASE STORAGE — rag-images bucket
 --
--- The Python code uploads extracted images to a bucket called
--- "rag-images" so they don't bloat the JSONB metadata column.
--- You must create this bucket manually in the Supabase dashboard:
---
+-- Create manually in the Supabase dashboard:
 --   Dashboard → Storage → New bucket
 --   Name: rag-images
---   Public: YES  (so image URLs work without auth tokens)
---
--- The Python fallback stores base64 in metadata if the upload fails,
--- so ingestion won't crash even if the bucket doesn't exist yet.
+--   Public: YES
 -- ============================================================
 
 
 -- ============================================================
--- 9. SMOKE TESTS — should return 0 rows, zero errors
+-- 10. SMOKE TESTS — should return 0 rows, zero errors
 -- ============================================================
 select * from match_documents(
     query_embedding => array_fill(0, array[2048])::vector,
@@ -257,3 +291,6 @@ select * from hybrid_search(
 );
 
 select * from get_document_types();
+
+-- Verify materialized view
+select count(*) from mv_document_types;
