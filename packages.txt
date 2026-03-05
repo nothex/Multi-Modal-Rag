@@ -1,5 +1,15 @@
+# System deps for unstructured hi_res + OCR on Streamlit Cloud (Debian bullseye)
+# 
+# WHY THIS MATTERS:
+# Streamlit Cloud base image is Debian bullseye (11). The default tesseract-ocr
+# from trixie repos requires libglib2.0-0t64 which conflicts with bullseye's
+# libglib2.0-0. Fix: pin tesseract from bullseye-backports and use libglib2.0-dev
+# which satisfies both sides of the conflict.
+
 libmagic-dev
 poppler-utils
+libgl1-mesa-glx
+libglib2.0-dev
 tesseract-ocr
-libgl1
-libglib2.0-0
+tesseract-ocr-eng
+libtesseract-dev
